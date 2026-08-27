@@ -1,13 +1,13 @@
 # Repository format
 
-Format version: `1`
+Format version: `2`
 
 ## Layout
 
 ```text
 <repo>/
-  VERSION                 # ASCII integer, currently "1\n"
-  index.redb              # completed backup index
+  VERSION                 # ASCII integer, currently "2\n"
+  index.redb              # completed backup and tombstone index
   .lock                   # exclusive OS flock (survives crash without manual cleanup)
   chunks/<aa>/<rest>      # immutable compressed chunk files
   manifests/<id>.manifest # published manifests
@@ -19,7 +19,7 @@ remaining 62 hex characters.
 
 ## Magic and versions
 
-- Repository `VERSION` file: `REPO_FORMAT_VERSION = 1`
+- Repository `VERSION` file: `REPO_FORMAT_VERSION = 2`
 - Manifest bytes: 8-byte magic `ZSTNMFST` + little-endian `u32` format version + JSON body
 - Unknown major versions are rejected
 
@@ -89,12 +89,16 @@ payload length are recorded in that backup's manifest.
 8. `rename` into `manifests/<id>.manifest` as a human-readable copy.
 
 `list`, `inspect`, `verify`, and `restore` load completed backups from
-`index.redb` only. A crash after the file rename but before the database
-commit cannot expose an unfinished backup. A crash after the database
-commit but before the file rename still leaves the backup visible, because
-the authoritative copy is in redb.
+`index.redb` only and hide any backup ID present in the `tombstones` table.
+Tombstoning never modifies completed backup bytes or chunk files. A crash after
+the file rename but before the database commit cannot expose an unfinished
+backup. A crash after the database commit but before the file rename still
+leaves the backup visible, because the authoritative copy is in redb.
 
 ## Compatibility
 
 Readers must reject an unknown `VERSION` or unknown manifest magic/version.
-Existing v1 repositories are opened idempotently by `init`.
+Version 1 readers do not understand tombstones, so version 2 repositories are
+not readable by them. `Repository::open` rejects version 1 without mutation.
+`Repository::init` explicitly migrates version 1 by creating the tombstone table
+and only then atomically replacing `VERSION` with `2\n`.

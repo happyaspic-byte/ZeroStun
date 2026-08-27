@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::codec::{CompressionCodec, StoredChunk};
 use crate::error::{Error, Result};
 use crate::ids::{validate_backup_id, ContentId};
-use crate::lifecycle::delete::{DeletePlan, DeleteResult, TOMBSTONES};
+use crate::lifecycle::delete::{
+    DeletePlan, DeleteResult, UndeletePlan, UndeleteResult, TOMBSTONES,
+};
 use crate::manifest::Manifest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,7 +26,7 @@ pub struct BackupSummaryItem {
     pub root_hash: String,
 }
 
-pub const REPO_FORMAT_VERSION: u32 = 1;
+pub const REPO_FORMAT_VERSION: u32 = 2;
 pub const REPO_LAYOUT_VERSION_FILE: &str = "VERSION";
 pub const REPO_CHUNKS_DIR: &str = "chunks";
 pub const REPO_MANIFESTS_DIR: &str = "manifests";
@@ -58,26 +60,24 @@ impl Repository {
         fs::create_dir_all(path.join(REPO_TMP_DIR))?;
 
         let version_file = path.join(REPO_LAYOUT_VERSION_FILE);
-        if version_file.exists() {
+        let found = if version_file.exists() {
             let content = fs::read_to_string(&version_file)?;
-            let found: u32 =
-                content
-                    .trim()
-                    .parse()
-                    .map_err(|_| Error::UnsupportedRepositoryVersion {
-                        found: 0,
-                        supported: REPO_FORMAT_VERSION,
-                    })?;
-            if found != REPO_FORMAT_VERSION {
+            Some(content.trim().parse::<u32>().map_err(|_| {
+                Error::UnsupportedRepositoryVersion {
+                    found: 0,
+                    supported: REPO_FORMAT_VERSION,
+                }
+            })?)
+        } else {
+            None
+        };
+        if let Some(found) = found {
+            if found != 1 && found != REPO_FORMAT_VERSION {
                 return Err(Error::UnsupportedRepositoryVersion {
                     found,
                     supported: REPO_FORMAT_VERSION,
                 });
             }
-        } else {
-            let tmp_version = path.join(REPO_TMP_DIR).join("VERSION.init");
-            fs::write(&tmp_version, format!("{REPO_FORMAT_VERSION}\n"))?;
-            fs::rename(tmp_version, &version_file)?;
         }
 
         let db_path = path.join(REPO_DB_FILE);
@@ -85,11 +85,16 @@ impl Repository {
         {
             let write_txn = db.begin_write()?;
             {
-                let _ = write_txn.open_table(TABLE_BACKUPS);
-                let _ = write_txn.open_table(TABLE_CHUNKS);
-                let _ = write_txn.open_table(TOMBSTONES);
+                let _ = write_txn.open_table(TABLE_BACKUPS)?;
+                let _ = write_txn.open_table(TABLE_CHUNKS)?;
+                let _ = write_txn.open_table(TOMBSTONES)?;
             }
             write_txn.commit()?;
+        }
+        if found != Some(REPO_FORMAT_VERSION) {
+            let tmp_version = path.join(REPO_TMP_DIR).join("VERSION.init");
+            fs::write(&tmp_version, format!("{REPO_FORMAT_VERSION}\n"))?;
+            fs::rename(tmp_version, &version_file)?;
         }
 
         Ok(Self {
@@ -123,13 +128,6 @@ impl Repository {
         }
         let db_path = path.join(REPO_DB_FILE);
         let db = Database::open(db_path)?;
-        {
-            let write_txn = db.begin_write()?;
-            {
-                let _ = write_txn.open_table(TOMBSTONES)?;
-            }
-            write_txn.commit()?;
-        }
         Ok(Self {
             root: path.to_path_buf(),
             db,
@@ -250,7 +248,15 @@ impl Repository {
 
         let write_txn = self.db.begin_write()?;
         {
+            let tombstones = write_txn.open_table(TOMBSTONES)?;
+            if tombstones.get(manifest.backup_id.as_str())?.is_some() {
+                return Err(Error::BackupDeleted(manifest.backup_id.clone()));
+            }
+            drop(tombstones);
             let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
+            if backups.get(manifest.backup_id.as_str())?.is_some() {
+                return Err(Error::BackupAlreadyExists(manifest.backup_id.clone()));
+            }
             backups.insert(manifest.backup_id.as_str(), encoded.as_slice())?;
 
             let mut chunks = write_txn.open_table(TABLE_CHUNKS)?;
@@ -266,13 +272,20 @@ impl Repository {
     }
 
     pub fn plan_delete(&self, backup_id: &str) -> Result<DeletePlan> {
-        self.load_manifest_including_deleted(backup_id)?;
+        validate_backup_id(backup_id)?;
+        let read_txn = self.db.begin_read()?;
+        let backups = read_txn.open_table(TABLE_BACKUPS)?;
+        if backups.get(backup_id)?.is_none() {
+            return Err(Error::BackupNotFound(backup_id.to_string()));
+        }
+        let tombstones = read_txn.open_table(TOMBSTONES)?;
         Ok(DeletePlan {
             backup_id: backup_id.to_string(),
-            already_deleted: self.is_tombstoned(backup_id)?,
+            already_deleted: tombstones.get(backup_id)?.is_some(),
         })
     }
 
+    /// Applies a delete plan. The caller must hold the repository writer lock.
     pub fn apply_delete(&self, plan: &DeletePlan) -> Result<DeleteResult> {
         validate_backup_id(&plan.backup_id)?;
         let write_txn = self.db.begin_write()?;
@@ -295,6 +308,41 @@ impl Repository {
         Ok(DeleteResult {
             backup_id: plan.backup_id.clone(),
             tombstoned,
+        })
+    }
+
+    pub fn plan_undelete(&self, backup_id: &str) -> Result<UndeletePlan> {
+        validate_backup_id(backup_id)?;
+        let read_txn = self.db.begin_read()?;
+        let backups = read_txn.open_table(TABLE_BACKUPS)?;
+        if backups.get(backup_id)?.is_none() {
+            return Err(Error::BackupNotFound(backup_id.to_string()));
+        }
+        let tombstones = read_txn.open_table(TOMBSTONES)?;
+        Ok(UndeletePlan {
+            backup_id: backup_id.to_string(),
+            tombstoned: tombstones.get(backup_id)?.is_some(),
+        })
+    }
+
+    /// Applies an undelete plan. The caller must hold the repository writer lock.
+    pub fn apply_undelete(&self, plan: &UndeletePlan) -> Result<UndeleteResult> {
+        validate_backup_id(&plan.backup_id)?;
+        let write_txn = self.db.begin_write()?;
+        let restored = {
+            let backups = write_txn.open_table(TABLE_BACKUPS)?;
+            if backups.get(plan.backup_id.as_str())?.is_none() {
+                return Err(Error::BackupNotFound(plan.backup_id.clone()));
+            }
+            drop(backups);
+            let mut tombstones = write_txn.open_table(TOMBSTONES)?;
+            let removed = tombstones.remove(plan.backup_id.as_str())?.is_some();
+            removed
+        };
+        write_txn.commit()?;
+        Ok(UndeleteResult {
+            backup_id: plan.backup_id.clone(),
+            restored,
         })
     }
 

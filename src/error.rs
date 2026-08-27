@@ -47,6 +47,9 @@ pub enum Error {
     #[error("backup not found: {0}")]
     BackupNotFound(String),
 
+    #[error("backup already exists: {0}")]
+    BackupAlreadyExists(String),
+
     #[error("backup has been deleted: {0}")]
     BackupDeleted(String),
 
@@ -153,6 +156,7 @@ impl Error {
             | Error::NotARepository(_)
             | Error::UnsupportedRepositoryVersion { .. }
             | Error::BackupNotFound(_)
+            | Error::BackupAlreadyExists(_)
             | Error::BackupDeleted(_) => ExitCode::Repository,
             Error::RepositoryLocked(_) => ExitCode::Locked,
             Error::SourceChanged(_) => ExitCode::SourceChanged,

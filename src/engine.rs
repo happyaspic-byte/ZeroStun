@@ -434,6 +434,10 @@ pub async fn restore(
     target_path: &Path,
     force: bool,
 ) -> Result<()> {
+    if repo.is_tombstoned(backup_id)? {
+        return Err(Error::BackupDeleted(backup_id.to_string()));
+    }
+
     let report = verify(repo, backup_id).await?;
     if !report.is_ok() {
         return Err(Error::RootHashMismatch {

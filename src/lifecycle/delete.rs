@@ -14,3 +14,15 @@ pub struct DeleteResult {
     pub backup_id: String,
     pub tombstoned: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndeletePlan {
+    pub backup_id: String,
+    pub tombstoned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UndeleteResult {
+    pub backup_id: String,
+    pub restored: bool,
+}
