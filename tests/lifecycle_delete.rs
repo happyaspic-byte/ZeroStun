@@ -76,10 +76,10 @@ async fn tombstone_hides_backup_without_deleting_chunks() {
         zerostun::engine::inspect(&fixture.repo, &fixture.backup_id),
         Err(Error::BackupDeleted(ref id)) if id == &fixture.backup_id
     ));
-    let verify = zerostun::engine::verify(&fixture.repo, &fixture.backup_id)
-        .await
-        .unwrap();
-    assert!(!verify.is_ok());
+    assert!(matches!(
+        zerostun::engine::verify(&fixture.repo, &fixture.backup_id).await,
+        Err(Error::BackupDeleted(ref id)) if id == &fixture.backup_id
+    ));
     let restore_target = fixture._temp.path().join("restored.bin");
     let restore_error =
         zerostun::engine::restore(&fixture.repo, &fixture.backup_id, &restore_target, false)

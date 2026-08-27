@@ -19,5 +19,6 @@ pub use config::BackupConfig;
 pub use engine::{backup, inspect, restore, verify, BackupSummary, InspectReport, VerifyReport};
 pub use error::{Error, ExitCode};
 pub use lifecycle::{DeletePlan, DeleteResult, UndeletePlan, UndeleteResult};
+pub use lifecycle::{ReaderLease, ReaderLeaseGuard};
 pub use repository::{BackupSummaryItem, Repository};
 pub use source::FileSource;

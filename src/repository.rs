@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use fs4::FileExt;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -12,6 +13,10 @@ use crate::error::{Error, Result};
 use crate::ids::{validate_backup_id, ContentId};
 use crate::lifecycle::delete::{
     DeletePlan, DeleteResult, UndeletePlan, UndeleteResult, TOMBSTONES,
+};
+use crate::lifecycle::lease::{
+    insert_reader_lease, is_process_stale, read_active_reader_leases, ReaderLease,
+    ReaderLeaseGuard, READER_LEASES,
 };
 use crate::manifest::Manifest;
 
@@ -50,7 +55,7 @@ impl Drop for RepositoryLock {
 
 pub struct Repository {
     root: PathBuf,
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl Repository {
@@ -95,6 +100,7 @@ impl Repository {
                 let write_txn = db.begin_write()?;
                 {
                     let _ = write_txn.open_table(TOMBSTONES)?;
+                    let _ = write_txn.open_table(READER_LEASES)?;
                 }
                 write_txn.commit()?;
             }
@@ -107,6 +113,7 @@ impl Repository {
                     let _ = write_txn.open_table(TABLE_BACKUPS)?;
                     let _ = write_txn.open_table(TABLE_CHUNKS)?;
                     let _ = write_txn.open_table(TOMBSTONES)?;
+                    let _ = write_txn.open_table(READER_LEASES)?;
                 }
                 write_txn.commit()?;
             }
@@ -118,7 +125,7 @@ impl Repository {
 
         Ok(Self {
             root: path.to_path_buf(),
-            db,
+            db: Arc::new(db),
         })
     }
 
@@ -149,7 +156,7 @@ impl Repository {
         let db = Database::open(db_path)?;
         Ok(Self {
             root: path.to_path_buf(),
-            db,
+            db: Arc::new(db),
         })
     }
 
@@ -392,21 +399,78 @@ impl Repository {
         Ok(tombstones.get(backup_id)?.is_some())
     }
 
-    pub fn load_manifest(&self, backup_id: &str) -> Result<Manifest> {
-        if self.is_tombstoned(backup_id)? {
-            return Err(Error::BackupDeleted(backup_id.to_string()));
-        }
-        self.load_manifest_including_deleted(backup_id)
+    pub fn acquire_reader_lease(&self, backup_id: &str) -> Result<ReaderLeaseGuard> {
+        self.resolve_manifest_with_reader_lease(backup_id)
+            .map(|(_, guard)| guard)
     }
 
-    fn load_manifest_including_deleted(&self, backup_id: &str) -> Result<Manifest> {
+    pub(crate) fn resolve_manifest_with_reader_lease(
+        &self,
+        backup_id: &str,
+    ) -> Result<(Manifest, ReaderLeaseGuard)> {
+        validate_backup_id(backup_id)?;
+        let write_txn = self.db.begin_write()?;
+        let manifest = {
+            let backups = write_txn.open_table(TABLE_BACKUPS)?;
+            let bytes = backups
+                .get(backup_id)?
+                .map(|value| value.value().to_vec())
+                .ok_or_else(|| Error::BackupNotFound(backup_id.to_string()))?;
+            drop(backups);
+            let tombstones = write_txn.open_table(TOMBSTONES)?;
+            if tombstones.get(backup_id)?.is_some() {
+                return Err(Error::BackupDeleted(backup_id.to_string()));
+            }
+            drop(tombstones);
+            Manifest::decode(&bytes)?
+        };
+        let (_, lease_id) = insert_reader_lease(&write_txn, backup_id)?;
+        write_txn.commit()?;
+        Ok((
+            manifest,
+            ReaderLeaseGuard::new(Arc::clone(&self.db), lease_id),
+        ))
+    }
+
+    pub fn active_reader_leases(&self) -> Result<Vec<ReaderLease>> {
+        let read_txn = self.db.begin_read()?;
+        read_active_reader_leases(&read_txn)
+    }
+
+    pub fn remove_stale_reader_leases(&self) -> Result<Vec<String>> {
+        let write_txn = self.db.begin_write()?;
+        let removed = {
+            let mut table = write_txn.open_table(READER_LEASES)?;
+            let mut stale_ids = Vec::new();
+            for item in table.iter()? {
+                let (key, value) = item?;
+                let lease = ReaderLease::decode(value.value())?;
+                if is_process_stale(lease.pid, &lease.process_start_token) {
+                    stale_ids.push(key.value().to_string());
+                }
+            }
+            stale_ids.sort();
+            for lease_id in &stale_ids {
+                let _ = table.remove(lease_id.as_str())?;
+            }
+            stale_ids
+        };
+        write_txn.commit()?;
+        Ok(removed)
+    }
+
+    pub fn load_manifest(&self, backup_id: &str) -> Result<Manifest> {
         validate_backup_id(backup_id)?;
         let read_txn = self.db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         let bytes = backups
             .get(backup_id)?
-            .map(|v| v.value().to_vec())
+            .map(|value| value.value().to_vec())
             .ok_or_else(|| Error::BackupNotFound(backup_id.to_string()))?;
+        let tombstones = read_txn.open_table(TOMBSTONES)?;
+        if tombstones.get(backup_id)?.is_some() {
+            return Err(Error::BackupDeleted(backup_id.to_string()));
+        }
         Manifest::decode(&bytes)
     }
 

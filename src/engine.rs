@@ -275,8 +275,9 @@ pub async fn backup(
 }
 
 pub async fn verify(repo: &Repository, backup_id: &str) -> Result<VerifyReport> {
-    let manifest = match repo.load_manifest(backup_id) {
-        Ok(m) => m,
+    let (manifest, _lease) = match repo.resolve_manifest_with_reader_lease(backup_id) {
+        Ok(resolved) => resolved,
+        Err(error @ (Error::BackupNotFound(_) | Error::BackupDeleted(_))) => return Err(error),
         Err(e) => {
             return Ok(VerifyReport {
                 backup_id: backup_id.to_string(),
@@ -288,8 +289,13 @@ pub async fn verify(repo: &Repository, backup_id: &str) -> Result<VerifyReport> 
             });
         }
     };
+    verify_manifest(repo, &manifest)
+}
 
-    let expected_root = root_hash_from_manifest(&manifest);
+fn verify_manifest(repo: &Repository, manifest: &Manifest) -> Result<VerifyReport> {
+    let backup_id = manifest.backup_id.as_str();
+
+    let expected_root = root_hash_from_manifest(manifest);
     if manifest.root_hash != expected_root {
         return Ok(VerifyReport {
             backup_id: backup_id.to_string(),
@@ -434,18 +440,14 @@ pub async fn restore(
     target_path: &Path,
     force: bool,
 ) -> Result<()> {
-    if repo.is_tombstoned(backup_id)? {
-        return Err(Error::BackupDeleted(backup_id.to_string()));
-    }
-
-    let report = verify(repo, backup_id).await?;
+    let (manifest, _lease) = repo.resolve_manifest_with_reader_lease(backup_id)?;
+    let report = verify_manifest(repo, &manifest)?;
     if !report.is_ok() {
         return Err(Error::RootHashMismatch {
             backup_id: backup_id.to_string(),
         });
     }
 
-    let manifest = repo.load_manifest(backup_id)?;
     let expected_root = root_hash_from_manifest(&manifest);
     if manifest.root_hash != expected_root {
         return Err(Error::RootHashMismatch {
