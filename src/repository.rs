@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::codec::{CompressionCodec, StoredChunk};
 use crate::error::{Error, Result};
 use crate::ids::{validate_backup_id, ContentId};
+use crate::lifecycle::delete::{DeletePlan, DeleteResult, TOMBSTONES};
 use crate::manifest::Manifest;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -86,6 +87,7 @@ impl Repository {
             {
                 let _ = write_txn.open_table(TABLE_BACKUPS);
                 let _ = write_txn.open_table(TABLE_CHUNKS);
+                let _ = write_txn.open_table(TOMBSTONES);
             }
             write_txn.commit()?;
         }
@@ -121,6 +123,13 @@ impl Repository {
         }
         let db_path = path.join(REPO_DB_FILE);
         let db = Database::open(db_path)?;
+        {
+            let write_txn = db.begin_write()?;
+            {
+                let _ = write_txn.open_table(TOMBSTONES)?;
+            }
+            write_txn.commit()?;
+        }
         Ok(Self {
             root: path.to_path_buf(),
             db,
@@ -256,7 +265,54 @@ impl Repository {
         Ok(())
     }
 
+    pub fn plan_delete(&self, backup_id: &str) -> Result<DeletePlan> {
+        self.load_manifest_including_deleted(backup_id)?;
+        Ok(DeletePlan {
+            backup_id: backup_id.to_string(),
+            already_deleted: self.is_tombstoned(backup_id)?,
+        })
+    }
+
+    pub fn apply_delete(&self, plan: &DeletePlan) -> Result<DeleteResult> {
+        validate_backup_id(&plan.backup_id)?;
+        let write_txn = self.db.begin_write()?;
+        let tombstoned = {
+            let backups = write_txn.open_table(TABLE_BACKUPS)?;
+            if backups.get(plan.backup_id.as_str())?.is_none() {
+                return Err(Error::BackupNotFound(plan.backup_id.clone()));
+            }
+            drop(backups);
+
+            let mut tombstones = write_txn.open_table(TOMBSTONES)?;
+            if tombstones.get(plan.backup_id.as_str())?.is_some() {
+                false
+            } else {
+                tombstones.insert(plan.backup_id.as_str(), unix_ms())?;
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(DeleteResult {
+            backup_id: plan.backup_id.clone(),
+            tombstoned,
+        })
+    }
+
+    pub fn is_tombstoned(&self, backup_id: &str) -> Result<bool> {
+        validate_backup_id(backup_id)?;
+        let read_txn = self.db.begin_read()?;
+        let tombstones = read_txn.open_table(TOMBSTONES)?;
+        Ok(tombstones.get(backup_id)?.is_some())
+    }
+
     pub fn load_manifest(&self, backup_id: &str) -> Result<Manifest> {
+        if self.is_tombstoned(backup_id)? {
+            return Err(Error::BackupDeleted(backup_id.to_string()));
+        }
+        self.load_manifest_including_deleted(backup_id)
+    }
+
+    fn load_manifest_including_deleted(&self, backup_id: &str) -> Result<Manifest> {
         validate_backup_id(backup_id)?;
         let read_txn = self.db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
@@ -278,9 +334,13 @@ impl Repository {
     pub fn list_backup_summaries(&self) -> Result<Vec<BackupSummaryItem>> {
         let read_txn = self.db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
+        let tombstones = read_txn.open_table(TOMBSTONES)?;
         let mut items = Vec::new();
         for item in backups.iter()? {
-            let (_, value) = item?;
+            let (key, value) = item?;
+            if tombstones.get(key.value())?.is_some() {
+                continue;
+            }
             let manifest = Manifest::decode(value.value())?;
             let stored_bytes = manifest.chunks.iter().map(|c| c.stored_length).sum();
             items.push(BackupSummaryItem {
@@ -296,6 +356,13 @@ impl Repository {
         items.sort_by(|a, b| a.backup_id.cmp(&b.backup_id));
         Ok(items)
     }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn getrandom_hex(bytes_len: usize) -> String {

@@ -47,6 +47,9 @@ pub enum Error {
     #[error("backup not found: {0}")]
     BackupNotFound(String),
 
+    #[error("backup has been deleted: {0}")]
+    BackupDeleted(String),
+
     #[error("chunk {content_id} is missing from the repository")]
     ChunkMissing { content_id: String },
 
@@ -149,7 +152,8 @@ impl Error {
             Error::RepositoryNotInitialized(_)
             | Error::NotARepository(_)
             | Error::UnsupportedRepositoryVersion { .. }
-            | Error::BackupNotFound(_) => ExitCode::Repository,
+            | Error::BackupNotFound(_)
+            | Error::BackupDeleted(_) => ExitCode::Repository,
             Error::RepositoryLocked(_) => ExitCode::Locked,
             Error::SourceChanged(_) => ExitCode::SourceChanged,
             Error::ChunkMissing { .. }
