@@ -49,10 +49,15 @@ fn evaluate_retention_with_mode(
 ) -> Result<PrunePlan> {
     validate_policy(policy)?;
 
-    let available_ids: HashSet<&str> = backups
-        .iter()
-        .map(|backup| backup.backup_id.as_str())
-        .collect();
+    let mut available_ids = HashSet::with_capacity(backups.len());
+    for backup in backups {
+        if !available_ids.insert(backup.backup_id.as_str()) {
+            return Err(Error::InvalidConfig(format!(
+                "duplicate backup ID: {}",
+                backup.backup_id
+            )));
+        }
+    }
     let missing_protected: Vec<&String> = policy
         .protected_ids
         .iter()

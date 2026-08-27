@@ -72,20 +72,87 @@ fn same_timestamp_tie_breaks_by_backup_id() {
 }
 
 #[test]
-fn future_backups_do_not_fill_elapsed_buckets() {
+fn duplicate_ids_with_different_timestamps_are_rejected() {
+    let backups = vec![
+        summary("duplicate", DAY_MS * 3),
+        summary("duplicate", DAY_MS),
+    ];
+    let policy = RetentionPolicy {
+        keep_last: 1,
+        ..RetentionPolicy::default()
+    };
+
+    let error = evaluate_retention(&backups, &policy, DAY_MS * 4).unwrap_err();
+
+    assert!(matches!(error, zerostun::error::Error::InvalidConfig(_)));
+    assert!(error.to_string().contains("duplicate"));
+}
+
+#[test]
+fn duplicate_ids_with_identical_metadata_are_rejected() {
+    let backup = summary("duplicate", DAY_MS);
+    let policy = RetentionPolicy {
+        keep_last: 1,
+        ..RetentionPolicy::default()
+    };
+
+    let error = evaluate_retention(&[backup.clone(), backup], &policy, DAY_MS * 2).unwrap_err();
+
+    assert!(matches!(error, zerostun::error::Error::InvalidConfig(_)));
+    assert!(error.to_string().contains("duplicate"));
+}
+
+#[test]
+fn weekly_exact_boundary_is_included() {
+    let now = DAY_MS * 21;
+    let backups = vec![
+        summary("boundary", DAY_MS * 14),
+        summary("outside", DAY_MS * 13),
+    ];
+    let policy = RetentionPolicy {
+        weekly_weeks: 2,
+        ..RetentionPolicy::default()
+    };
+
+    let plan = evaluate_retention(&backups, &policy, now).unwrap();
+
+    assert_eq!(plan.keep, vec!["boundary"]);
+    assert_eq!(plan.delete, vec!["outside"]);
+}
+
+#[test]
+fn future_backup_can_be_kept_by_keep_last() {
     let backups = vec![
         summary("present", FIXED_NOW),
         summary("future", FIXED_NOW + DAY_MS),
     ];
     let policy = RetentionPolicy {
+        keep_last: 1,
         daily_days: 1,
         ..RetentionPolicy::default()
     };
 
     let plan = evaluate_retention(&backups, &policy, FIXED_NOW).unwrap();
 
-    assert_eq!(plan.keep, vec!["present"]);
-    assert_eq!(plan.delete, vec!["future"]);
+    assert_eq!(plan.keep, vec!["future", "present"]);
+    assert!(plan.delete.is_empty());
+}
+
+#[test]
+fn maximum_timestamp_does_not_overflow() {
+    let backups = vec![summary("maximum", u64::MAX)];
+    let policy = RetentionPolicy {
+        keep_last: 1,
+        daily_days: u32::MAX,
+        weekly_weeks: u32::MAX,
+        monthly_months: u32::MAX,
+        protected_ids: BTreeSet::new(),
+    };
+
+    let plan = evaluate_retention(&backups, &policy, u64::MAX).unwrap();
+
+    assert_eq!(plan.keep, vec!["maximum"]);
+    assert!(plan.delete.is_empty());
 }
 
 #[test]
