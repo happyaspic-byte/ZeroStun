@@ -50,13 +50,16 @@ fn evaluate_retention_with_mode(
     validate_policy(policy)?;
 
     let mut available_ids = HashSet::with_capacity(backups.len());
+    let mut duplicate_ids = BTreeSet::new();
     for backup in backups {
         if !available_ids.insert(backup.backup_id.as_str()) {
-            return Err(Error::InvalidConfig(format!(
-                "duplicate backup ID: {}",
-                backup.backup_id
-            )));
+            duplicate_ids.insert(backup.backup_id.as_str());
         }
+    }
+    if let Some(duplicate_id) = duplicate_ids.first() {
+        return Err(Error::InvalidConfig(format!(
+            "duplicate backup ID: {duplicate_id}"
+        )));
     }
     let missing_protected: Vec<&String> = policy
         .protected_ids

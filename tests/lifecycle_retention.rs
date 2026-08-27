@@ -103,6 +103,32 @@ fn duplicate_ids_with_identical_metadata_are_rejected() {
 }
 
 #[test]
+fn duplicate_error_is_independent_of_input_order() {
+    let policy = RetentionPolicy {
+        keep_last: 1,
+        ..RetentionPolicy::default()
+    };
+    let forward = vec![
+        summary("z-duplicate", DAY_MS * 4),
+        summary("z-duplicate", DAY_MS * 3),
+        summary("a-duplicate", DAY_MS * 2),
+        summary("a-duplicate", DAY_MS),
+    ];
+    let mut reverse = forward.clone();
+    reverse.reverse();
+
+    let forward_error = evaluate_retention(&forward, &policy, DAY_MS * 5)
+        .unwrap_err()
+        .to_string();
+    let reverse_error = evaluate_retention(&reverse, &policy, DAY_MS * 5)
+        .unwrap_err()
+        .to_string();
+
+    assert_eq!(forward_error, reverse_error);
+    assert!(forward_error.contains("a-duplicate"));
+}
+
+#[test]
 fn weekly_exact_boundary_is_included() {
     let now = DAY_MS * 21;
     let backups = vec![
@@ -118,6 +144,24 @@ fn weekly_exact_boundary_is_included() {
 
     assert_eq!(plan.keep, vec!["boundary"]);
     assert_eq!(plan.delete, vec!["outside"]);
+}
+
+#[test]
+fn future_backup_is_not_kept_by_elapsed_daily_bucket() {
+    let now = FIXED_NOW + 1_000;
+    let backups = vec![
+        summary("present", FIXED_NOW),
+        summary("future", now + 1_000),
+    ];
+    let policy = RetentionPolicy {
+        daily_days: 1,
+        ..RetentionPolicy::default()
+    };
+
+    let plan = evaluate_retention(&backups, &policy, now).unwrap();
+
+    assert_eq!(plan.keep, vec!["present"]);
+    assert_eq!(plan.delete, vec!["future"]);
 }
 
 #[test]
