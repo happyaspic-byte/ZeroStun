@@ -1,0 +1,278 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+
+use crate::codec::{CompressionCodec, StoredChunk};
+use crate::error::{Error, Result};
+use crate::ids::{validate_backup_id, ContentId};
+use crate::manifest::Manifest;
+
+pub const REPO_FORMAT_VERSION: u32 = 1;
+pub const REPO_LAYOUT_VERSION_FILE: &str = "VERSION";
+pub const REPO_CHUNKS_DIR: &str = "chunks";
+pub const REPO_MANIFESTS_DIR: &str = "manifests";
+pub const REPO_TMP_DIR: &str = "tmp";
+pub const REPO_LOCK_FILE: &str = ".lock";
+pub const REPO_DB_FILE: &str = "index.redb";
+
+const TABLE_BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+const TABLE_CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
+
+#[derive(Debug)]
+pub struct RepositoryLock {
+    _file: File,
+    path: PathBuf,
+}
+
+impl Drop for RepositoryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub struct Repository {
+    root: PathBuf,
+    db: Database,
+}
+
+impl Repository {
+    pub fn init(path: &Path) -> Result<Self> {
+        fs::create_dir_all(path.join(REPO_CHUNKS_DIR))?;
+        fs::create_dir_all(path.join(REPO_MANIFESTS_DIR))?;
+        fs::create_dir_all(path.join(REPO_TMP_DIR))?;
+
+        let version_file = path.join(REPO_LAYOUT_VERSION_FILE);
+        if version_file.exists() {
+            let content = fs::read_to_string(&version_file)?;
+            let found: u32 =
+                content
+                    .trim()
+                    .parse()
+                    .map_err(|_| Error::UnsupportedRepositoryVersion {
+                        found: 0,
+                        supported: REPO_FORMAT_VERSION,
+                    })?;
+            if found != REPO_FORMAT_VERSION {
+                return Err(Error::UnsupportedRepositoryVersion {
+                    found,
+                    supported: REPO_FORMAT_VERSION,
+                });
+            }
+        } else {
+            let tmp_version = path.join(REPO_TMP_DIR).join("VERSION.init");
+            fs::write(&tmp_version, format!("{REPO_FORMAT_VERSION}\n"))?;
+            fs::rename(tmp_version, &version_file)?;
+        }
+
+        let db_path = path.join(REPO_DB_FILE);
+        let db = Database::create(db_path)?;
+        {
+            let write_txn = db.begin_write()?;
+            {
+                let _ = write_txn.open_table(TABLE_BACKUPS);
+                let _ = write_txn.open_table(TABLE_CHUNKS);
+            }
+            write_txn.commit()?;
+        }
+
+        Ok(Self {
+            root: path.to_path_buf(),
+            db,
+        })
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(Error::RepositoryNotInitialized(path.to_path_buf()));
+        }
+        let version_file = path.join(REPO_LAYOUT_VERSION_FILE);
+        if !version_file.exists() {
+            return Err(Error::NotARepository(path.to_path_buf()));
+        }
+        let content = fs::read_to_string(&version_file)?;
+        let found: u32 =
+            content
+                .trim()
+                .parse()
+                .map_err(|_| Error::UnsupportedRepositoryVersion {
+                    found: 0,
+                    supported: REPO_FORMAT_VERSION,
+                })?;
+        if found != REPO_FORMAT_VERSION {
+            return Err(Error::UnsupportedRepositoryVersion {
+                found,
+                supported: REPO_FORMAT_VERSION,
+            });
+        }
+        let db_path = path.join(REPO_DB_FILE);
+        let db = Database::open(db_path)?;
+        Ok(Self {
+            root: path.to_path_buf(),
+            db,
+        })
+    }
+
+    pub fn acquire_writer_lock(&self) -> Result<RepositoryLock> {
+        let lock_path = self.root.join(REPO_LOCK_FILE);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    Error::RepositoryLocked(self.root.clone())
+                } else {
+                    Error::Io(e)
+                }
+            })?;
+        Ok(RepositoryLock {
+            _file: file,
+            path: lock_path,
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn chunk_path(&self, cid: &ContentId) -> PathBuf {
+        let hex = cid.to_hex();
+        let prefix = &hex[0..2];
+        let rest = &hex[2..];
+        self.root.join(REPO_CHUNKS_DIR).join(prefix).join(rest)
+    }
+
+    pub fn has_chunk(&self, cid: &ContentId) -> bool {
+        self.chunk_path(cid).is_file()
+    }
+
+    pub fn read_chunk(&self, cid: &ContentId) -> Result<StoredChunk> {
+        let path = self.chunk_path(cid);
+        if !path.is_file() {
+            return Err(Error::ChunkMissing {
+                content_id: cid.to_hex(),
+            });
+        }
+        let bytes = fs::read(&path).map_err(|e| Error::ChunkCorrupt {
+            content_id: cid.to_hex(),
+            reason: e.to_string(),
+        })?;
+        StoredChunk::decode(&bytes).map_err(|e| Error::ChunkCorrupt {
+            content_id: cid.to_hex(),
+            reason: e.to_string(),
+        })
+    }
+
+    pub fn write_chunk(
+        &self,
+        cid: &ContentId,
+        codec: CompressionCodec,
+        compressed_payload: &[u8],
+    ) -> Result<(bool, CompressionCodec, u64)> {
+        if let Ok(existing) = self.read_chunk(cid) {
+            return Ok((false, existing.codec, existing.payload.len() as u64));
+        }
+        let target = self.chunk_path(cid);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let encoded = StoredChunk::encode(codec, compressed_payload);
+        let rnd = getrandom_hex(6);
+        let tmp_path = self
+            .root
+            .join(REPO_TMP_DIR)
+            .join(format!("chunk-{}-{rnd}", cid.to_hex()));
+
+        let mut f = File::create(&tmp_path)?;
+        f.write_all(&encoded)?;
+        f.flush()?;
+        f.sync_all()?;
+        drop(f);
+
+        match fs::rename(&tmp_path, &target) {
+            Ok(()) => Ok((true, codec, compressed_payload.len() as u64)),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                if let Ok(existing) = self.read_chunk(cid) {
+                    Ok((false, existing.codec, existing.payload.len() as u64))
+                } else {
+                    Err(Error::RepositoryWrite(format!(
+                        "failed to commit chunk {}: {e}",
+                        cid.to_hex()
+                    )))
+                }
+            }
+        }
+    }
+
+    pub fn commit_manifest(&self, manifest: &Manifest) -> Result<()> {
+        validate_backup_id(&manifest.backup_id)?;
+        let encoded = manifest.encode()?;
+        let target = self
+            .root
+            .join(REPO_MANIFESTS_DIR)
+            .join(format!("{}.manifest", manifest.backup_id));
+
+        let rnd = getrandom_hex(6);
+        let tmp_path = self
+            .root
+            .join(REPO_TMP_DIR)
+            .join(format!("manifest-{}-{rnd}", manifest.backup_id));
+
+        let mut f = File::create(&tmp_path)?;
+        f.write_all(&encoded)?;
+        f.flush()?;
+        f.sync_all()?;
+        drop(f);
+
+        fs::rename(&tmp_path, &target)?;
+
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
+            backups.insert(manifest.backup_id.as_str(), encoded.as_slice())?;
+
+            let mut chunks = write_txn.open_table(TABLE_CHUNKS)?;
+            for c in &manifest.chunks {
+                let hex = c.content_id.to_hex();
+                let prev = chunks.get(hex.as_str())?.map(|v| v.value()).unwrap_or(0);
+                chunks.insert(hex.as_str(), prev + 1)?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    pub fn load_manifest(&self, backup_id: &str) -> Result<Manifest> {
+        validate_backup_id(backup_id)?;
+        let manifest_path = self
+            .root
+            .join(REPO_MANIFESTS_DIR)
+            .join(format!("{backup_id}.manifest"));
+        if !manifest_path.is_file() {
+            return Err(Error::BackupNotFound(backup_id.to_string()));
+        }
+        let bytes = fs::read(&manifest_path)?;
+        Manifest::decode(&bytes)
+    }
+
+    pub fn list_backups(&self) -> Result<Vec<String>> {
+        let read_txn = self.db.begin_read()?;
+        let backups = read_txn.open_table(TABLE_BACKUPS)?;
+        let mut ids = Vec::new();
+        for item in backups.iter()? {
+            let (k, _) = item?;
+            ids.push(k.value().to_string());
+        }
+        ids.sort();
+        Ok(ids)
+    }
+}
+
+fn getrandom_hex(bytes_len: usize) -> String {
+    let mut buf = vec![0u8; bytes_len];
+    let _ = getrandom::fill(&mut buf);
+    hex::encode(buf)
+}

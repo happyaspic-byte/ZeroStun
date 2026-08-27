@@ -1,0 +1,96 @@
+# Repository format
+
+Format version: `1`
+
+## Layout
+
+```text
+<repo>/
+  VERSION                 # ASCII integer, currently "1\n"
+  index.redb              # completed backup index
+  .lock                   # exclusive writer lock (create_new)
+  chunks/<aa>/<rest>      # immutable compressed chunk files
+  manifests/<id>.manifest # published manifests
+  tmp/                    # temporary files, never listed as backups
+```
+
+`<aa>` is the first two hex characters of the content ID. `<rest>` is the
+remaining 62 hex characters.
+
+## Magic and versions
+
+- Repository `VERSION` file: `REPO_FORMAT_VERSION = 1`
+- Manifest bytes: 8-byte magic `ZSTNMFST` + little-endian `u32` format version + JSON body
+- Unknown major versions are rejected
+
+## Content ID
+
+```text
+content_id = BLAKE3(
+    "ZeroStun/ChunkContent/v1" ||
+    little-endian u64 original_length ||
+    original_bytes
+)
+```
+
+The content ID is independent of compression codec and compressor version.
+
+## Root hash
+
+```text
+root_hash = BLAKE3(
+    "ZeroStun/RootManifest/v1" ||
+    format_version_le_u32 ||
+    total_logical_bytes_le_u64 ||
+    chunk_count_le_u64 ||
+    fastcdc_min_le_u32 ||
+    fastcdc_avg_le_u32 ||
+    fastcdc_max_le_u32 ||
+    for each chunk in order:
+        index_le_u64 ||
+        logical_offset_le_u64 ||
+        original_length_le_u64 ||
+        stored_length_le_u64 ||
+        content_id_32_bytes ||
+        codec_tag_u8
+)
+```
+
+Codec tags: `none=0`, `zstd=1`, `lz4=2`.
+
+Golden vectors live in `tests/core_pipeline.rs`.
+
+## Stored chunk file
+
+Each file under `chunks/` is:
+
+```text
+8 bytes  magic "ZSTNCHNK"
+4 bytes  little-endian version (1)
+1 byte   codec tag (none=0, zstd=1, lz4=2)
+3 bytes  reserved zeros
+8 bytes  little-endian compressed payload length
+N bytes  compressed payload
+```
+
+Dedupe keys on the original-byte content ID. If a later backup requests a
+different codec for the same original bytes, the existing on-disk codec and
+payload length are recorded in that backup's manifest.
+
+## Atomic commit
+
+1. Write chunk payload to `tmp/chunk-<id>-<rand>`.
+2. `flush` + `sync_all`.
+3. `rename` into `chunks/<aa>/<rest>`.
+4. If the destination already exists, keep the existing chunk.
+5. Write the encoded manifest to `tmp/manifest-<id>-<rand>`.
+6. `flush` + `sync_all` + `rename` into `manifests/<id>.manifest`.
+7. Insert the backup into `index.redb` in the same logical publish step.
+
+Incomplete backups never appear in `list` because listing reads the completed
+index, not the tmp directory.
+
+## Compatibility
+
+Readers must reject an unknown `VERSION` or unknown manifest magic/version.
+Existing v1 repositories are opened idempotently by `init`.

@@ -1,32 +1,52 @@
 [package]
 name = "zerostun"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+rust-version = "1.85"
+authors = ["ZeroStun Contributors"]
+description = "A lightweight, bounded-I/O backup engine for edge and fault-tolerant systems"
+license = "Apache-2.0 OR MIT"
+readme = "README.md"
+repository = "https://github.com/happyaspic-byte/ZeroStun"
+keywords = ["backup", "deduplication", "fastcdc", "integrity"]
+categories = ["command-line-utilities", "filesystem"]
+
+[lib]
+name = "zerostun"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zerostun"
+path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.104"
-blake3 = "1.8.7"
-clap = { version = "4.6.6", features = ["derive", "env"] }
-fastcdc = "5.0.0"
-fs4 = "1.1.0"
-getrandom = "0.4.3"
-hex = "0.4.3"
-indicatif = "0.18.6"
-lz4_flex = "0.14.0"
-redb = "4.2.0"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-util = { version = "0.7.19", features = ["rt"] }
+clap = { version = "4.6.6", features = ["derive", "env"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 toml = "1.1.4"
+fastcdc = "5.0.0"
+blake3 = "1.8.7"
+zstd = "0.13.3"
+lz4_flex = { version = "0.14.0", default-features = true }
+redb = "4.2.0"
+indicatif = "0.18.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-zstd = "0.13.3"
+anyhow = "1.0.104"
+thiserror = "2.0.20"
+hex = "0.4.3"
+fs4 = "1.1.0"
+getrandom = "0.4.3"
 
 [dev-dependencies]
+tempfile = "3.27.0"
 assert_cmd = "2.2.2"
-criterion = { version = "0.8.2", features = ["async_tokio"] }
 predicates = "3.1.4"
 proptest = "1.11.0"
-tempfile = "3.27.0"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+
+[[bench]]
+name = "engine_bench"
+harness = false

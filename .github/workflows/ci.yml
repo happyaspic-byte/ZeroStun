@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --lib --bin zerostun -- -D warnings
+      - name: Test
+        run: cargo test --lib --bins --tests -- --test-threads=1
+      - name: Release build
+        run: cargo build --release
+      - name: CLI smoke
+        run: |
+          set -euo pipefail
+          bin=./target/release/zerostun
+          tmp=$(mktemp -d)
+          python3 - <<PY
+          from pathlib import Path
+          p = Path("${tmp}/source.bin")
+          with p.open("wb") as f:
+              for i in range(50_000):
+                  f.write((i & 0xffffffff).to_bytes(4, "little"))
+          PY
+          "$bin" init --repo "${tmp}/repo"
+          "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/source.bin" --codec none > "${tmp}/backup.json"
+          id=$(python3 -c "import json; print(json.load(open('${tmp}/backup.json'))['backup_id'])")
+          "$bin" verify --repo "${tmp}/repo" --backup-id "$id"
+          "$bin" restore --repo "${tmp}/repo" --backup-id "$id" --target "${tmp}/restored.bin"
+          cmp "${tmp}/source.bin" "${tmp}/restored.bin"
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
