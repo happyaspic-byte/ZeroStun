@@ -8,7 +8,7 @@ Format version: `1`
 <repo>/
   VERSION                 # ASCII integer, currently "1\n"
   index.redb              # completed backup index
-  .lock                   # exclusive writer lock (create_new)
+  .lock                   # exclusive OS flock (survives crash without manual cleanup)
   chunks/<aa>/<rest>      # immutable compressed chunk files
   manifests/<id>.manifest # published manifests
   tmp/                    # temporary files, never listed as backups
@@ -84,11 +84,15 @@ payload length are recorded in that backup's manifest.
 3. `rename` into `chunks/<aa>/<rest>`.
 4. If the destination already exists, keep the existing chunk.
 5. Write the encoded manifest to `tmp/manifest-<id>-<rand>`.
-6. `flush` + `sync_all` + `rename` into `manifests/<id>.manifest`.
-7. Insert the backup into `index.redb` in the same logical publish step.
+6. `flush` + `sync_all`.
+7. Insert the encoded bytes into `index.redb` and commit.
+8. `rename` into `manifests/<id>.manifest` as a human-readable copy.
 
-Incomplete backups never appear in `list` because listing reads the completed
-index, not the tmp directory.
+`list`, `inspect`, `verify`, and `restore` load completed backups from
+`index.redb` only. A crash after the file rename but before the database
+commit cannot expose an unfinished backup. A crash after the database
+commit but before the file rename still leaves the backup visible, because
+the authoritative copy is in redb.
 
 ## Compatibility
 

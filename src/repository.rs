@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use fs4::FileExt;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use crate::codec::{CompressionCodec, StoredChunk};
@@ -23,12 +24,11 @@ const TABLE_CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
 #[derive(Debug)]
 pub struct RepositoryLock {
     _file: File,
-    path: PathBuf,
 }
 
 impl Drop for RepositoryLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = FileExt::unlock(&self._file);
     }
 }
 
@@ -118,19 +118,18 @@ impl Repository {
         let lock_path = self.root.join(REPO_LOCK_FILE);
         let file = OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .open(&lock_path)
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    Error::RepositoryLocked(self.root.clone())
-                } else {
-                    Error::Io(e)
-                }
-            })?;
-        Ok(RepositoryLock {
-            _file: file,
-            path: lock_path,
-        })
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
+        FileExt::try_lock(&file).map_err(|e| {
+            let io_err: std::io::Error = e.into();
+            if io_err.kind() == std::io::ErrorKind::WouldBlock {
+                Error::RepositoryLocked(self.root.clone())
+            } else {
+                Error::Io(io_err)
+            }
+        })?;
+        Ok(RepositoryLock { _file: file })
     }
 
     pub fn root(&self) -> &Path {
@@ -227,8 +226,6 @@ impl Repository {
         f.sync_all()?;
         drop(f);
 
-        fs::rename(&tmp_path, &target)?;
-
         let write_txn = self.db.begin_write()?;
         {
             let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
@@ -242,19 +239,18 @@ impl Repository {
             }
         }
         write_txn.commit()?;
+        fs::rename(&tmp_path, &target)?;
         Ok(())
     }
 
     pub fn load_manifest(&self, backup_id: &str) -> Result<Manifest> {
         validate_backup_id(backup_id)?;
-        let manifest_path = self
-            .root
-            .join(REPO_MANIFESTS_DIR)
-            .join(format!("{backup_id}.manifest"));
-        if !manifest_path.is_file() {
-            return Err(Error::BackupNotFound(backup_id.to_string()));
-        }
-        let bytes = fs::read(&manifest_path)?;
+        let read_txn = self.db.begin_read()?;
+        let backups = read_txn.open_table(TABLE_BACKUPS)?;
+        let bytes = backups
+            .get(backup_id)?
+            .map(|v| v.value().to_vec())
+            .ok_or_else(|| Error::BackupNotFound(backup_id.to_string()))?;
         Manifest::decode(&bytes)
     }
 
