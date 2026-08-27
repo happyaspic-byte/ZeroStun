@@ -1,22 +1,40 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::chunking::{stream_chunks, Chunk};
+use crate::chunking::stream_chunks;
 use crate::codec::{Compressor, MAX_ORIGINAL_CHUNK_BYTES};
 use crate::config::BackupConfig;
 use crate::error::{Error, Result};
 use crate::hash::{content_id_from_bytes, root_hash_from_manifest};
-use crate::ids::generate_backup_id;
+use crate::ids::{generate_backup_id, ContentId};
 use crate::manifest::{ChunkDescriptor, Manifest};
 use crate::rate_limit::TokenBucket;
 use crate::repository::Repository;
 use crate::source::FileSource;
 use crate::telemetry::ProgressMode;
+
+#[derive(Debug)]
+struct IndexedChunk {
+    index: u64,
+    offset: u64,
+    data: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct ProcessedChunk {
+    index: u64,
+    offset: u64,
+    original_length: u64,
+    content_id: ContentId,
+    compressed: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackupSummary {
@@ -95,7 +113,9 @@ pub async fn backup(
     );
     manifest.source_path = source_canon.to_string_lossy().to_string();
 
-    let (chunk_tx, mut chunk_rx) = mpsc::channel::<Chunk>(config.queue_depth);
+    let (raw_tx, raw_rx) = mpsc::channel::<IndexedChunk>(config.queue_depth);
+    let (processed_tx, mut processed_rx) =
+        mpsc::channel::<Result<ProcessedChunk>>(config.queue_depth);
 
     let mut read_bucket = TokenBucket::new(config.read_bytes_per_sec, config.read_iops)?;
     let mut write_bucket = TokenBucket::new(config.write_bytes_per_sec, None)?;
@@ -117,62 +137,114 @@ pub async fn backup(
 
     let source_file = source.file()?;
     let reader_handle = tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut index = 0u64;
         stream_chunks(source_file, chunk_params, |chunk| {
             let nbytes = chunk.data.len() as u64;
+            if nbytes > MAX_ORIGINAL_CHUNK_BYTES {
+                return Err(Error::ChunkEncode(format!(
+                    "chunk at offset {} exceeds max original size {MAX_ORIGINAL_CHUNK_BYTES}",
+                    chunk.offset
+                )));
+            }
             read_bucket.consume_blocking(nbytes);
-            if chunk_tx.blocking_send(chunk).is_err() {
+            if raw_tx
+                .blocking_send(IndexedChunk {
+                    index,
+                    offset: chunk.offset,
+                    data: chunk.data,
+                })
+                .is_err()
+            {
                 return Err(Error::Cancelled);
             }
+            index += 1;
             Ok(())
         })
     });
 
+    let codec = config.codec;
+    let raw_rx = Arc::new(tokio::sync::Mutex::new(raw_rx));
+    let mut worker_handles = Vec::with_capacity(config.workers);
+    for _ in 0..config.workers {
+        let raw_rx = Arc::clone(&raw_rx);
+        let processed_tx = processed_tx.clone();
+        worker_handles.push(tokio::task::spawn_blocking(move || -> Result<()> {
+            loop {
+                let chunk = {
+                    let mut rx = raw_rx.blocking_lock();
+                    rx.blocking_recv()
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
+                let original_length = chunk.data.len() as u64;
+                let content_id = content_id_from_bytes(&chunk.data);
+                let compressed = Compressor::compress(codec, &chunk.data)?;
+                if processed_tx
+                    .blocking_send(Ok(ProcessedChunk {
+                        index: chunk.index,
+                        offset: chunk.offset,
+                        original_length,
+                        content_id,
+                        compressed,
+                    }))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(())
+        }));
+    }
+    drop(processed_tx);
+
     let mut stored_bytes = 0u64;
     let mut unique_chunks = 0usize;
     let mut reused_chunks = 0usize;
-    let mut chunk_index = 0u64;
+    let mut next_index = 0u64;
+    let mut pending: BTreeMap<u64, ProcessedChunk> = BTreeMap::new();
 
-    while let Some(chunk) = chunk_rx.recv().await {
-        let raw_bytes = chunk.data;
-        let cid = content_id_from_bytes(&raw_bytes);
-        let orig_len = raw_bytes.len() as u64;
-        if orig_len > MAX_ORIGINAL_CHUNK_BYTES {
-            return Err(Error::ChunkEncode(format!(
-                "chunk at offset {} exceeds max original size {MAX_ORIGINAL_CHUNK_BYTES}",
-                chunk.offset
-            )));
+    while let Some(processed) = processed_rx.recv().await {
+        let processed = processed?;
+        pending.insert(processed.index, processed);
+        while let Some(chunk) = pending.remove(&next_index) {
+            write_bucket.consume(chunk.compressed.len() as u64).await;
+            let (is_new, stored_codec, stored_len) =
+                repo.write_chunk(&chunk.content_id, codec, &chunk.compressed)?;
+            if is_new {
+                unique_chunks += 1;
+            } else {
+                reused_chunks += 1;
+            }
+            stored_bytes += stored_len;
+            if let Some(pb) = &progress {
+                pb.inc(chunk.original_length);
+            }
+            manifest.add_chunk(ChunkDescriptor {
+                index: chunk.index,
+                logical_offset: chunk.offset,
+                original_length: chunk.original_length,
+                stored_length: stored_len,
+                codec: stored_codec,
+                content_id: chunk.content_id,
+            });
+            next_index += 1;
         }
-
-        let compressed = Compressor::compress(config.codec, &raw_bytes)?;
-        write_bucket.consume(compressed.len() as u64).await;
-
-        let (is_new, stored_codec, stored_len) =
-            repo.write_chunk(&cid, config.codec, &compressed)?;
-        if is_new {
-            unique_chunks += 1;
-        } else {
-            reused_chunks += 1;
-        }
-        stored_bytes += stored_len;
-
-        if let Some(pb) = &progress {
-            pb.inc(orig_len);
-        }
-
-        manifest.add_chunk(ChunkDescriptor {
-            index: chunk_index,
-            logical_offset: chunk.offset,
-            original_length: orig_len,
-            stored_length: stored_len,
-            codec: stored_codec,
-            content_id: cid,
-        });
-        chunk_index += 1;
     }
 
     reader_handle
         .await
         .map_err(|e| Error::ChunkEncode(format!("join error: {e}")))??;
+    for handle in worker_handles {
+        handle
+            .await
+            .map_err(|e| Error::ChunkEncode(format!("worker join error: {e}")))??;
+    }
+    if !pending.is_empty() {
+        return Err(Error::ChunkEncode(
+            "backup ended with unordered leftover chunks".to_string(),
+        ));
+    }
 
     if let Some(pb) = progress {
         pb.finish_and_clear();

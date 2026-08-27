@@ -5,10 +5,23 @@ use std::path::{Path, PathBuf};
 use fs4::FileExt;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
+use serde::{Deserialize, Serialize};
+
 use crate::codec::{CompressionCodec, StoredChunk};
 use crate::error::{Error, Result};
 use crate::ids::{validate_backup_id, ContentId};
 use crate::manifest::Manifest;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupSummaryItem {
+    pub backup_id: String,
+    pub created_unix_ms: u64,
+    pub source_path: String,
+    pub total_logical_bytes: u64,
+    pub total_chunks: usize,
+    pub stored_bytes: u64,
+    pub root_hash: String,
+}
 
 pub const REPO_FORMAT_VERSION: u32 = 1;
 pub const REPO_LAYOUT_VERSION_FILE: &str = "VERSION";
@@ -255,15 +268,33 @@ impl Repository {
     }
 
     pub fn list_backups(&self) -> Result<Vec<String>> {
+        Ok(self
+            .list_backup_summaries()?
+            .into_iter()
+            .map(|item| item.backup_id)
+            .collect())
+    }
+
+    pub fn list_backup_summaries(&self) -> Result<Vec<BackupSummaryItem>> {
         let read_txn = self.db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
-        let mut ids = Vec::new();
+        let mut items = Vec::new();
         for item in backups.iter()? {
-            let (k, _) = item?;
-            ids.push(k.value().to_string());
+            let (_, value) = item?;
+            let manifest = Manifest::decode(value.value())?;
+            let stored_bytes = manifest.chunks.iter().map(|c| c.stored_length).sum();
+            items.push(BackupSummaryItem {
+                backup_id: manifest.backup_id,
+                created_unix_ms: manifest.created_unix_ms,
+                source_path: manifest.source_path,
+                total_logical_bytes: manifest.total_logical_bytes,
+                total_chunks: manifest.chunks.len(),
+                stored_bytes,
+                root_hash: manifest.root_hash.to_hex(),
+            });
         }
-        ids.sort();
-        Ok(ids)
+        items.sort_by(|a, b| a.backup_id.cmp(&b.backup_id));
+        Ok(items)
     }
 }
 

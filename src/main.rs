@@ -253,7 +253,7 @@ async fn run(cli: Cli) -> zerostun::error::Result<ExitCode> {
         }
         Commands::List { repo } => {
             let repo = Repository::open(&repo)?;
-            let list = repo.list_backups()?;
+            let list = repo.list_backup_summaries()?;
             if cli.json {
                 println!(
                     "{}",
@@ -262,8 +262,18 @@ async fn run(cli: Cli) -> zerostun::error::Result<ExitCode> {
                 );
             } else if !cli.quiet {
                 println!("Backups ({}):", list.len());
-                for id in list {
-                    println!("  {id}");
+                println!(
+                    "{:<30} {:>12} {:>8}  SOURCE",
+                    "BACKUP ID", "BYTES", "CHUNKS"
+                );
+                for item in list {
+                    println!(
+                        "{:<30} {:>12} {:>8}  {}",
+                        item.backup_id,
+                        item.total_logical_bytes,
+                        item.total_chunks,
+                        item.source_path
+                    );
                 }
             }
             Ok(ExitCode::Success)

@@ -24,9 +24,9 @@ ZeroStun is a single CLI binary with library modules that have one responsibilit
 2. Open the source file and record size + mtime.
 3. Stream FastCDC chunks from a blocking reader one chunk at a time.
 4. Apply the read token bucket before enqueueing each bounded chunk.
-5. Feed chunks through a bounded `mpsc` channel of `queue_depth`.
-6. Hash original bytes (`ZeroStun/ChunkContent/v1`).
-7. Compress with the requested codec.
+5. Assign a sequence index and send original bytes through a bounded channel.
+6. `workers` blocking tasks hash original bytes and compress in parallel.
+7. Reorder processed chunks by sequence index before repository writes.
 8. Consume write tokens, then write the chunk if it is new.
 9. If the content ID already exists, reuse the on-disk codec and length.
 10. Append ordered descriptors to the in-memory manifest.
@@ -52,7 +52,7 @@ Configurations where `max_chunk * queue_depth > 1 GiB` are rejected.
 ## Resource limits
 
 - Default FastCDC: 8 KiB / 64 KiB / 256 KiB
-- Default workers: `min(available_parallelism, 4)`
+- Default workers: `min(available_parallelism, 4)` (hash + compress only; writes stay ordered)
 - Default queue depth: 8
 - Default codec: zstd level 3
 - Decompress allocates at most the declared original length

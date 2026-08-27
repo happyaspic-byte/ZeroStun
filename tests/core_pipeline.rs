@@ -136,6 +136,49 @@ async fn test_codecs_and_deduplication() {
 }
 
 #[tokio::test]
+async fn test_parallel_workers_preserve_chunk_order() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+
+    let src = temp.path().join("multi_worker.bin");
+    let mut data = Vec::new();
+    for i in 0..150_000u32 {
+        data.extend_from_slice(&i.to_le_bytes());
+    }
+    std::fs::write(&src, &data).unwrap();
+
+    let cfg = BackupConfig {
+        min_chunk: 1024,
+        avg_chunk: 4096,
+        max_chunk: 8192,
+        codec: CompressionCodec::Zstd { level: 3 },
+        workers: 4,
+        queue_depth: 16,
+        ..Default::default()
+    };
+
+    let summary = zerostun::engine::backup(&repo, &src, &cfg).await.unwrap();
+    assert!(summary.total_chunks > 10);
+
+    let verify = zerostun::engine::verify(&repo, &summary.backup_id)
+        .await
+        .unwrap();
+    assert!(verify.is_ok());
+
+    let restored = temp.path().join("restored_multi.bin");
+    zerostun::engine::restore(&repo, &summary.backup_id, &restored, false)
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(&restored).unwrap(), data);
+
+    let list = repo.list_backup_summaries().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].backup_id, summary.backup_id);
+    assert_eq!(list[0].total_logical_bytes, data.len() as u64);
+}
+
+#[tokio::test]
 async fn test_corruption_detection() {
     let temp = tempfile::tempdir().unwrap();
     let repo_path = temp.path().join("repo");

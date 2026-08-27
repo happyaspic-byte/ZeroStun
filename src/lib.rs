@@ -17,4 +17,4 @@ pub mod telemetry;
 pub use config::BackupConfig;
 pub use engine::{backup, inspect, restore, verify, BackupSummary, InspectReport, VerifyReport};
 pub use error::{Error, ExitCode};
-pub use repository::Repository;
+pub use repository::{BackupSummaryItem, Repository};
