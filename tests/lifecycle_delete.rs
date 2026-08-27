@@ -239,24 +239,134 @@ fn v1_open_rejects_without_schema_or_version_mutation() {
 
 #[test]
 fn init_explicitly_migrates_v1_repository_to_v2() {
+    const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
     let temp = tempfile::tempdir().unwrap();
     let repo_path = temp.path().join("repo");
     make_v1_repository(&repo_path);
+    let backup_bytes = b"existing-v1-manifest";
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write_txn = db.begin_write().unwrap();
+    {
+        let mut backups = write_txn.open_table(BACKUPS).unwrap();
+        backups
+            .insert("backup-existing-format", backup_bytes.as_slice())
+            .unwrap();
+    }
+    write_txn.commit().unwrap();
+    drop(db);
 
     let repo = Repository::init(&repo_path).unwrap();
+    drop(repo);
 
     assert_eq!(
         std::fs::read_to_string(repo_path.join("VERSION")).unwrap(),
         "2\n"
     );
-    assert!(!repo.is_tombstoned("backup-existing-format").unwrap());
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let read_txn = db.begin_read().unwrap();
+    let backups = read_txn.open_table(BACKUPS).unwrap();
+    assert_eq!(
+        backups
+            .get("backup-existing-format")
+            .unwrap()
+            .unwrap()
+            .value(),
+        backup_bytes
+    );
 }
 
-fn make_v1_repository(repo_path: &std::path::Path) {
+#[test]
+fn v1_migration_rejects_missing_index_without_creating_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    make_v1_layout(&repo_path);
+    let db_path = repo_path.join("index.redb");
+
+    assert!(matches!(
+        Repository::init(&repo_path),
+        Err(Error::RepositoryNotInitialized(path)) if path == db_path
+    ));
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("VERSION")).unwrap(),
+        "1\n"
+    );
+    assert!(!db_path.exists());
+}
+
+#[test]
+fn v1_migration_rejects_missing_required_tables() {
+    for missing_backups in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        make_v1_layout(&repo_path);
+        let db = Database::create(repo_path.join("index.redb")).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+        const CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
+        if missing_backups {
+            let _ = write_txn.open_table(CHUNKS).unwrap();
+        } else {
+            let _ = write_txn.open_table(BACKUPS).unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(db);
+
+        assert!(Repository::init(&repo_path).is_err());
+        assert_v1_unmigrated(&repo_path);
+    }
+}
+
+#[test]
+fn v1_migration_rejects_incompatible_required_table_schemas() {
+    for bad_backups in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        make_v1_layout(&repo_path);
+        let db = Database::create(repo_path.join("index.redb")).unwrap();
+        let write_txn = db.begin_write().unwrap();
+        const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+        const BAD_BACKUPS: TableDefinition<&str, u64> = TableDefinition::new("backups");
+        const CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
+        const BAD_CHUNKS: TableDefinition<&str, &[u8]> = TableDefinition::new("chunks");
+        if bad_backups {
+            let _ = write_txn.open_table(BAD_BACKUPS).unwrap();
+            let _ = write_txn.open_table(CHUNKS).unwrap();
+        } else {
+            let _ = write_txn.open_table(BACKUPS).unwrap();
+            let _ = write_txn.open_table(BAD_CHUNKS).unwrap();
+        }
+        write_txn.commit().unwrap();
+        drop(db);
+
+        assert!(Repository::init(&repo_path).is_err());
+        assert_v1_unmigrated(&repo_path);
+    }
+}
+
+fn assert_v1_unmigrated(repo_path: &std::path::Path) {
+    assert_eq!(
+        std::fs::read_to_string(repo_path.join("VERSION")).unwrap(),
+        "1\n"
+    );
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let read_txn = db.begin_read().unwrap();
+    let names: Vec<_> = read_txn
+        .list_tables()
+        .unwrap()
+        .map(|table| redb::TableHandle::name(&table).to_string())
+        .collect();
+    assert!(!names.contains(&"tombstones".to_string()));
+}
+
+fn make_v1_layout(repo_path: &std::path::Path) {
     std::fs::create_dir_all(repo_path.join("chunks")).unwrap();
     std::fs::create_dir_all(repo_path.join("manifests")).unwrap();
     std::fs::create_dir_all(repo_path.join("tmp")).unwrap();
     std::fs::write(repo_path.join("VERSION"), "1\n").unwrap();
+}
+
+fn make_v1_repository(repo_path: &std::path::Path) {
+    make_v1_layout(repo_path);
     let db = Database::create(repo_path.join("index.redb")).unwrap();
     let write_txn = db.begin_write().unwrap();
     const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
@@ -328,7 +438,16 @@ fn assert_rejected_manifest_replacement(tombstone: bool) {
     let mut replacement = manifest_with_chunk(backup_id, replacement_cid);
     replacement.root_hash = zerostun::hash::root_hash_from_manifest(&replacement);
 
-    assert!(repo.commit_manifest(&replacement).is_err());
+    let temp_before = manifest_temp_paths(&repo);
+    for _ in 0..2 {
+        let error = repo.commit_manifest(&replacement).unwrap_err();
+        if tombstone {
+            assert!(matches!(error, Error::BackupDeleted(ref id) if id == backup_id));
+        } else {
+            assert!(matches!(error, Error::BackupAlreadyExists(ref id) if id == backup_id));
+        }
+    }
+    assert_eq!(manifest_temp_paths(&repo), temp_before);
     drop(repo);
 
     let db = Database::open(repo_path.join("index.redb")).unwrap();
@@ -351,6 +470,21 @@ fn assert_rejected_manifest_replacement(tombstone: bool) {
         .get(replacement_cid.to_hex().as_str())
         .unwrap()
         .is_none());
+}
+
+fn manifest_temp_paths(repo: &Repository) -> Vec<std::path::PathBuf> {
+    let mut paths: Vec<_> = std::fs::read_dir(repo.root().join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("manifest-")
+        })
+        .collect();
+    paths.sort();
+    paths
 }
 
 fn manifest_with_chunk(backup_id: &str, content_id: zerostun::ids::ContentId) -> Manifest {

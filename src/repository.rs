@@ -81,20 +81,39 @@ impl Repository {
         }
 
         let db_path = path.join(REPO_DB_FILE);
-        let db = Database::create(db_path)?;
-        {
-            let write_txn = db.begin_write()?;
-            {
-                let _ = write_txn.open_table(TABLE_BACKUPS)?;
-                let _ = write_txn.open_table(TABLE_CHUNKS)?;
-                let _ = write_txn.open_table(TOMBSTONES)?;
+        let db = if found == Some(1) {
+            if !db_path.is_file() {
+                return Err(Error::RepositoryNotInitialized(db_path));
             }
-            write_txn.commit()?;
-        }
+            let db = Database::open(&db_path)?;
+            {
+                let read_txn = db.begin_read()?;
+                let _ = read_txn.open_table(TABLE_BACKUPS)?;
+                let _ = read_txn.open_table(TABLE_CHUNKS)?;
+            }
+            {
+                let write_txn = db.begin_write()?;
+                {
+                    let _ = write_txn.open_table(TOMBSTONES)?;
+                }
+                write_txn.commit()?;
+            }
+            db
+        } else {
+            let db = Database::create(&db_path)?;
+            {
+                let write_txn = db.begin_write()?;
+                {
+                    let _ = write_txn.open_table(TABLE_BACKUPS)?;
+                    let _ = write_txn.open_table(TABLE_CHUNKS)?;
+                    let _ = write_txn.open_table(TOMBSTONES)?;
+                }
+                write_txn.commit()?;
+            }
+            db
+        };
         if found != Some(REPO_FORMAT_VERSION) {
-            let tmp_version = path.join(REPO_TMP_DIR).join("VERSION.init");
-            fs::write(&tmp_version, format!("{REPO_FORMAT_VERSION}\n"))?;
-            fs::rename(tmp_version, &version_file)?;
+            publish_repository_version(path, &version_file)?;
         }
 
         Ok(Self {
@@ -228,6 +247,7 @@ impl Repository {
 
     pub fn commit_manifest(&self, manifest: &Manifest) -> Result<()> {
         validate_backup_id(&manifest.backup_id)?;
+        self.ensure_backup_id_available(&manifest.backup_id)?;
         let encoded = manifest.encode()?;
         let target = self
             .root
@@ -240,34 +260,53 @@ impl Repository {
             .join(REPO_TMP_DIR)
             .join(format!("manifest-{}-{rnd}", manifest.backup_id));
 
-        let mut f = File::create(&tmp_path)?;
-        f.write_all(&encoded)?;
-        f.flush()?;
-        f.sync_all()?;
-        drop(f);
+        let result = (|| -> Result<()> {
+            let mut f = File::create(&tmp_path)?;
+            f.write_all(&encoded)?;
+            f.flush()?;
+            f.sync_all()?;
+            drop(f);
 
-        let write_txn = self.db.begin_write()?;
-        {
-            let tombstones = write_txn.open_table(TOMBSTONES)?;
-            if tombstones.get(manifest.backup_id.as_str())?.is_some() {
-                return Err(Error::BackupDeleted(manifest.backup_id.clone()));
-            }
-            drop(tombstones);
-            let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
-            if backups.get(manifest.backup_id.as_str())?.is_some() {
-                return Err(Error::BackupAlreadyExists(manifest.backup_id.clone()));
-            }
-            backups.insert(manifest.backup_id.as_str(), encoded.as_slice())?;
+            let write_txn = self.db.begin_write()?;
+            {
+                let tombstones = write_txn.open_table(TOMBSTONES)?;
+                if tombstones.get(manifest.backup_id.as_str())?.is_some() {
+                    return Err(Error::BackupDeleted(manifest.backup_id.clone()));
+                }
+                drop(tombstones);
+                let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
+                if backups.get(manifest.backup_id.as_str())?.is_some() {
+                    return Err(Error::BackupAlreadyExists(manifest.backup_id.clone()));
+                }
+                backups.insert(manifest.backup_id.as_str(), encoded.as_slice())?;
 
-            let mut chunks = write_txn.open_table(TABLE_CHUNKS)?;
-            for c in &manifest.chunks {
-                let hex = c.content_id.to_hex();
-                let prev = chunks.get(hex.as_str())?.map(|v| v.value()).unwrap_or(0);
-                chunks.insert(hex.as_str(), prev + 1)?;
+                let mut chunks = write_txn.open_table(TABLE_CHUNKS)?;
+                for c in &manifest.chunks {
+                    let hex = c.content_id.to_hex();
+                    let prev = chunks.get(hex.as_str())?.map(|v| v.value()).unwrap_or(0);
+                    chunks.insert(hex.as_str(), prev + 1)?;
+                }
             }
+            write_txn.commit()?;
+            fs::rename(&tmp_path, &target)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
         }
-        write_txn.commit()?;
-        fs::rename(&tmp_path, &target)?;
+        result
+    }
+
+    fn ensure_backup_id_available(&self, backup_id: &str) -> Result<()> {
+        let read_txn = self.db.begin_read()?;
+        let tombstones = read_txn.open_table(TOMBSTONES)?;
+        if tombstones.get(backup_id)?.is_some() {
+            return Err(Error::BackupDeleted(backup_id.to_string()));
+        }
+        let backups = read_txn.open_table(TABLE_BACKUPS)?;
+        if backups.get(backup_id)?.is_some() {
+            return Err(Error::BackupAlreadyExists(backup_id.to_string()));
+        }
         Ok(())
     }
 
@@ -404,6 +443,17 @@ impl Repository {
         items.sort_by(|a, b| a.backup_id.cmp(&b.backup_id));
         Ok(items)
     }
+}
+
+fn publish_repository_version(path: &Path, version_file: &Path) -> Result<()> {
+    let tmp_version = path.join(REPO_TMP_DIR).join("VERSION.init");
+    let mut file = File::create(&tmp_version)?;
+    file.write_all(format!("{REPO_FORMAT_VERSION}\n").as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(tmp_version, version_file)?;
+    Ok(())
 }
 
 fn unix_ms() -> u64 {
