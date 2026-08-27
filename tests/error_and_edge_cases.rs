@@ -89,3 +89,72 @@ async fn test_restore_force_overwrite() {
         b"original content to restore"
     );
 }
+
+#[tokio::test]
+async fn test_path_traversal_backup_id_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+
+    let malicious_ids = [
+        "../etc/passwd",
+        "../../shadow",
+        "/absolute/path",
+        "bkp/../../root",
+        "invalid spaces in id",
+    ];
+
+    for bad_id in malicious_ids {
+        let verify_res = zerostun::engine::verify(&repo, bad_id).await.unwrap();
+        assert!(!verify_res.is_ok());
+
+        let restore_res = zerostun::engine::restore(
+            &repo,
+            bad_id,
+            &temp.path().join("should_not_exist.bin"),
+            false,
+        )
+        .await;
+        assert!(restore_res.is_err());
+
+        let inspect_res = zerostun::engine::inspect(&repo, bad_id);
+        assert!(inspect_res.is_err());
+    }
+}
+
+#[tokio::test]
+async fn test_inspect_json_matches_schema() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+
+    let src = temp.path().join("inspect_src.bin");
+    std::fs::write(&src, b"deterministic inspection content").unwrap();
+
+    let summary = zerostun::engine::backup(&repo, &src, &BackupConfig::default())
+        .await
+        .unwrap();
+
+    let report = zerostun::engine::inspect(&repo, &summary.backup_id).unwrap();
+    assert_eq!(report.backup_id, summary.backup_id);
+    assert_eq!(
+        report.total_logical_bytes,
+        b"deterministic inspection content".len() as u64
+    );
+    assert!(report.total_chunks > 0);
+    assert_eq!(report.root_hash, summary.root_hash);
+    assert_eq!(report.fastcdc_params, (8192, 65536, 262144));
+}
+
+#[tokio::test]
+async fn test_source_mutation_triggers_fingerprint_check() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("mutating.bin");
+    std::fs::write(&src, b"initial bytes").unwrap();
+
+    let source = zerostun::FileSource::open(&src).unwrap();
+    assert!(source.verify_unchanged().is_ok());
+
+    std::fs::write(&src, b"mutated bytes with different length").unwrap();
+    assert!(source.verify_unchanged().is_err());
+}
