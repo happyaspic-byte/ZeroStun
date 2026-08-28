@@ -506,7 +506,7 @@ fn recover_gc_rolls_back_uncommitted_moves_from_fresh_open() {
     assert_eq!(recovered[0].phase, GcPhase::Planned);
     assert!(reopened.chunk_path(&cid).exists());
     assert!(!trash.exists());
-    assert_eq!(reopened.recover_gc().unwrap()[0].phase, GcPhase::Planned);
+    assert!(reopened.recover_gc().unwrap().is_empty());
 }
 
 #[test]
@@ -567,7 +567,139 @@ fn recover_gc_rolls_forward_committed_work_from_fresh_open() {
     assert_eq!(recovered[0].phase, GcPhase::Complete);
     assert!(!reopened.chunk_path(&cid).exists());
     assert!(!trash.exists());
-    assert_eq!(reopened.recover_gc().unwrap()[0].phase, GcPhase::Complete);
+    assert!(reopened.recover_gc().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_rejects_symlinked_trash_ancestor_without_touching_external_sentinel() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"escape-orphan");
+    repo.write_chunk(&cid, CompressionCodec::None, b"escape-orphan")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let external = temp.path().join("external");
+    std::fs::create_dir(&external).unwrap();
+    let sentinel = external.join("sentinel");
+    std::fs::write(&sentinel, b"untouched").unwrap();
+    symlink(&external, repo.root().join("trash")).unwrap();
+
+    assert!(repo.apply_gc(&plan).is_err());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+    assert!(repo.chunk_path(&cid).exists());
+}
+
+#[test]
+fn recovery_rejects_dual_source_trash_without_overwrite() {
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"dual-copy");
+    repo.write_chunk(&cid, CompressionCodec::None, b"dual-copy")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let trash = repo.root().join(&item.trash);
+    std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    std::fs::copy(repo.root().join(&item.source), &trash).unwrap();
+    let journal = GcJournal {
+        plan,
+        phase: GcPhase::Moving,
+        moved: vec![cid.to_hex()],
+    };
+    drop(repo);
+    insert_journal(&repo_path, &journal, GC_JOURNALS);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    assert!(reopened
+        .recover_gc()
+        .unwrap_err()
+        .to_string()
+        .contains("conflicting source and trash"));
+    assert!(reopened.chunk_path(&cid).exists());
+    assert!(trash.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_symlinked_trash_prefix_without_touching_external_sentinel() {
+    use std::os::unix::fs::symlink;
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"prefix-escape");
+    repo.write_chunk(&cid, CompressionCodec::None, b"prefix-escape")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let gc_root = repo.root().join("trash").join(&plan.gc_id);
+    std::fs::create_dir_all(&gc_root).unwrap();
+    let external = temp.path().join("external-prefix");
+    std::fs::create_dir(&external).unwrap();
+    let sentinel = external.join("sentinel");
+    std::fs::write(&sentinel, b"untouched").unwrap();
+    symlink(&external, gc_root.join(&item.content_id[..2])).unwrap();
+    let journal = GcJournal {
+        plan,
+        phase: GcPhase::Committed,
+        moved: Vec::new(),
+    };
+    drop(repo);
+    insert_journal(&repo_path, &journal, GC_JOURNALS);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    assert!(reopened.recover_gc().is_err());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+    assert!(reopened.chunk_path(&cid).exists());
+}
+
+#[test]
+fn plan_rejects_index_key_manifest_id_mismatch() {
+    const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let manifest = zerostun::manifest::Manifest::new("payload-id", 0, 64, 128, 256);
+    drop(repo);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        write
+            .open_table(BACKUPS)
+            .unwrap()
+            .insert("different-key", manifest.encode().unwrap().as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+
+    let repo = Repository::open(&repo_path).unwrap();
+    assert!(repo.plan_gc().is_err());
+}
+
+#[test]
+fn apply_rejects_new_tombstone_even_when_chunk_sets_are_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    commit_payloads(&repo, "backup-first", &[b"shared-only"]);
+    commit_payloads(&repo, "backup-second", &[b"shared-only"]);
+    repo.apply_delete(&repo.plan_delete("backup-first").unwrap())
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    repo.apply_delete(&repo.plan_delete("backup-second").unwrap())
+        .unwrap();
+
+    assert!(repo.apply_gc(&plan).is_err());
+    assert!(repo.is_tombstoned("backup-second").unwrap());
 }
 
 fn insert_journal(

@@ -102,9 +102,9 @@ Garbage collection is tombstone-based and split into deterministic plan/apply op
 `plan_gc` marks chunks from one redb snapshot of `backups` and `tombstones`; malformed
 manifests, missing live chunks, or unexpected chunk inventory names fail closed. Plans use
 repository-relative canonical `chunks/<aa>/<rest>` and `trash/<gc-id>/<aa>/<rest>` paths.
-`apply_gc` rechecks active reader leases and every planned path, content ID, byte count, and
-current live-set before mutation. It is a caller-held writer-lock primitive and never acquires
-a nested writer lock.
+`apply_gc` rechecks active reader leases and every planned path, content ID, byte count, exact
+tombstone generation set, and current live-set before mutation. Both `apply_gc` and destructive
+`recover_gc` are caller-held writer-lock primitives; neither acquires a nested writer lock.
 
 The `gc_journals` redb table stores bounded JSON `GcJournal` DTOs. Each journal contains its
 `GcPlan`, phase, and the content IDs durably recorded as moved. Move progress is committed in
@@ -118,9 +118,10 @@ Phases have these crash semantics:
 - `Moving`: recovery rolls every moved or rename-before-journal-update chunk back to `chunks/`.
 - `Committed`: deletion is irrevocable; recovery rolls forward from source or trash.
 - `Deleting`: recovery continues trash deletion, tombstone/index finalization, and manifest-copy removal.
-- `Complete`: recovery is idempotent and reports the completed journal without mutation.
+- `Complete`: terminal journal entries are removed; later recovery has no historical work to repeat.
 
-Recovery never overwrites an existing source or trash destination. Dual copies are corruption.
+Recovery removes rolled-back and completed journals durably. It never overwrites an existing
+source or trash destination. Dual copies are corruption.
 After `Committed`, authoritative `backups` and `tombstones` entries are removed consistently and
 the human-readable manifest copy is deleted, preventing undelete of a finalized backup. Chunks
 still referenced by any valid non-tombstoned manifest remain live.

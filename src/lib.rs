@@ -20,7 +20,7 @@ pub use engine::{backup, inspect, restore, verify, BackupSummary, InspectReport,
 pub use error::{Error, ExitCode};
 pub use lifecycle::{
     ChunkMove, DeletePlan, DeleteResult, GcJournal, GcPhase, GcPlan, GcRecoveryResult, GcResult,
-    UndeletePlan, UndeleteResult,
+    GcTombstone, UndeletePlan, UndeleteResult,
 };
 pub use lifecycle::{ReaderLease, ReaderLeaseGuard};
 pub use repository::{BackupSummaryItem, Repository};

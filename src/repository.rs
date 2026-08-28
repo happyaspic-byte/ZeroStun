@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use crate::lifecycle::delete::{
     DeletePlan, DeleteResult, UndeletePlan, UndeleteResult, TOMBSTONES,
 };
 use crate::lifecycle::gc::{
-    ChunkMove, GcJournal, GcPhase, GcPlan, GcRecoveryResult, GcResult, GC_JOURNALS,
+    ChunkMove, GcJournal, GcPhase, GcPlan, GcRecoveryResult, GcResult, GcTombstone, GC_JOURNALS,
 };
 use crate::lifecycle::lease::{
     insert_reader_lease, is_process_stale, read_active_reader_leases, ReaderLease,
@@ -450,6 +450,26 @@ impl Repository {
         read_active_reader_leases(&read_txn)
     }
 
+    fn allocate_gc_id(&self) -> Result<String> {
+        const MAX_ATTEMPTS: usize = 8;
+        for _ in 0..MAX_ATTEMPTS {
+            let gc_id = format!("gc-{}-{}", unix_ms(), getrandom_hex_result(8)?);
+            let read_txn = self.db.begin_read()?;
+            let journals = read_txn.open_table(GC_JOURNALS)?;
+            let journal_exists = journals.get(gc_id.as_str())?.is_some();
+            drop(journals);
+            drop(read_txn);
+            let trash_exists =
+                fs::symlink_metadata(self.root.join(REPO_TRASH_DIR).join(&gc_id)).is_ok();
+            if !journal_exists && !trash_exists {
+                return Ok(gc_id);
+            }
+        }
+        Err(Error::GarbageCollection(
+            "failed to allocate unique GC ID".to_string(),
+        ))
+    }
+
     pub fn plan_gc(&self) -> Result<GcPlan> {
         let read_txn = self.db.begin_read()?;
         if !read_active_reader_leases(&read_txn)?.is_empty() {
@@ -460,14 +480,38 @@ impl Repository {
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         let tombstones = read_txn.open_table(TOMBSTONES)?;
         let mut live = BTreeSet::new();
+        let mut planned_tombstones = Vec::new();
         for item in backups.iter()? {
             let (key, value) = item?;
+            validate_backup_id(key.value())?;
             let manifest = Manifest::decode(value.value())?;
-            if tombstones.get(key.value())?.is_some() {
+            if manifest.backup_id != key.value() {
+                return Err(Error::ManifestCorrupt(format!(
+                    "backup index key {} does not match manifest ID {}",
+                    key.value(),
+                    manifest.backup_id
+                )));
+            }
+            if let Some(deleted) = tombstones.get(key.value())? {
+                planned_tombstones.push(GcTombstone {
+                    backup_id: key.value().to_string(),
+                    deleted_unix_ms: deleted.value(),
+                });
                 continue;
             }
             live.extend(manifest.chunks.into_iter().map(|chunk| chunk.content_id));
         }
+        for item in tombstones.iter()? {
+            let (key, _) = item?;
+            validate_backup_id(key.value())?;
+            if backups.get(key.value())?.is_none() {
+                return Err(Error::GarbageCollection(format!(
+                    "tombstone {} has no authoritative backup",
+                    key.value()
+                )));
+            }
+        }
+        planned_tombstones.sort();
         for content_id in &live {
             if !self.chunk_path(content_id).is_file() {
                 return Err(Error::ChunkMissing {
@@ -476,7 +520,7 @@ impl Repository {
             }
         }
 
-        let gc_id = format!("gc-{}-{}", unix_ms(), getrandom_hex(8));
+        let gc_id = self.allocate_gc_id()?;
         let mut reclaim_chunks = Vec::new();
         for prefix_entry in fs::read_dir(self.root.join(REPO_CHUNKS_DIR))? {
             let prefix_entry = prefix_entry?;
@@ -531,6 +575,7 @@ impl Repository {
             live_chunks: live.len() as u64,
             reclaim_chunks,
             reclaim_bytes,
+            tombstones: planned_tombstones,
         })
     }
 
@@ -550,22 +595,26 @@ impl Repository {
         }
         let current = self.plan_gc()?;
         validate_gc_plan(plan, &current, &self.root)?;
+        ensure_gc_namespace_available(&self.db, &self.root, &plan.gc_id)?;
+        if !self.active_reader_leases()?.is_empty() {
+            return Err(Error::GarbageCollection(
+                "garbage collection refused while active reader leases exist".to_string(),
+            ));
+        }
         let mut journal = GcJournal {
             plan: plan.clone(),
             phase: GcPhase::Planned,
             moved: Vec::new(),
         };
-        persist_gc_journal(&self.db, &journal)?;
-        sync_database_parent(&self.root)?;
+        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
         journal.phase = GcPhase::Moving;
-        persist_gc_journal(&self.db, &journal)?;
-        sync_database_parent(&self.root)?;
+        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
         for (index, item) in plan.reclaim_chunks.iter().enumerate() {
             let source = self.root.join(&item.source);
             let trash = self.root.join(&item.trash);
-            if let Some(parent) = trash.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_gc_trash_parent(&self.root, plan, item)?;
+            validate_regular_file(&source, item.bytes)?;
+            validate_gc_trash_parent(&self.root, plan, item)?;
             fs::rename(&source, &trash)?;
             sync_directory(source.parent().unwrap_or(&self.root))?;
             sync_directory(trash.parent().unwrap_or(&self.root))?;
@@ -575,27 +624,26 @@ impl Repository {
                 ));
             }
             journal.moved.push(item.content_id.clone());
-            if journal.moved.len() % 128 == 0 || index + 1 == plan.reclaim_chunks.len() {
-                persist_gc_journal(&self.db, &journal)?;
-                sync_database_parent(&self.root)?;
+            if journal.moved.len() == crate::lifecycle::gc::GC_MOVE_BATCH_SIZE
+                || index + 1 == plan.reclaim_chunks.len()
+            {
+                persist_gc_journal_durable(&self.db, &self.root, &journal)?;
+                journal.moved.clear();
             }
         }
         journal.phase = GcPhase::Committed;
-        persist_gc_journal(&self.db, &journal)?;
-        sync_database_parent(&self.root)?;
+        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
         if fault == Some(GcFaultPoint::AfterCommitted) {
             return Err(Error::GarbageCollection(
                 "injected GC fault after committed marker".to_string(),
             ));
         }
         journal.phase = GcPhase::Deleting;
-        persist_gc_journal(&self.db, &journal)?;
-        sync_database_parent(&self.root)?;
+        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
         delete_gc_trash(&self.root, plan)?;
-        self.finalize_gc_tombstones()?;
+        self.finalize_gc_tombstones(&plan.tombstones)?;
         journal.phase = GcPhase::Complete;
-        persist_gc_journal(&self.db, &journal)?;
-        sync_database_parent(&self.root)?;
+        remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
         Ok(GcResult {
             gc_id: plan.gc_id.clone(),
             reclaimed_chunks: plan.reclaim_chunks.len() as u64,
@@ -608,6 +656,9 @@ impl Repository {
         self.apply_gc_inner(plan, Some(fault))
     }
 
+    /// Recovers interrupted GC work. The caller must hold the repository writer lock.
+    ///
+    /// This low-level primitive intentionally does not acquire a nested OS writer lock.
     pub fn recover_gc(&self) -> Result<Vec<GcRecoveryResult>> {
         let read_txn = self.db.begin_read()?;
         let table = read_txn.open_table(GC_JOURNALS)?;
@@ -626,46 +677,55 @@ impl Repository {
             match journal.phase {
                 GcPhase::Planned | GcPhase::Moving => {
                     rollback_gc_moves(&self.root, &journal.plan)?;
-                    journal.phase = GcPhase::Planned;
-                    journal.moved.clear();
-                    persist_gc_journal(&self.db, &journal)?;
-                    sync_database_parent(&self.root)?;
+                    remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
                 }
                 GcPhase::Committed | GcPhase::Deleting => {
+                    if !self.active_reader_leases()?.is_empty() {
+                        return Err(Error::GarbageCollection(
+                            "garbage collection recovery refused while active reader leases exist"
+                                .to_string(),
+                        ));
+                    }
                     journal.phase = GcPhase::Deleting;
-                    persist_gc_journal(&self.db, &journal)?;
-                    sync_database_parent(&self.root)?;
+                    persist_gc_journal_durable(&self.db, &self.root, &journal)?;
                     delete_gc_trash(&self.root, &journal.plan)?;
-                    self.finalize_gc_tombstones()?;
-                    journal.phase = GcPhase::Complete;
-                    persist_gc_journal(&self.db, &journal)?;
-                    sync_database_parent(&self.root)?;
+                    if !self.active_reader_leases()?.is_empty() {
+                        return Err(Error::GarbageCollection(
+                            "garbage collection recovery refused while active reader leases exist"
+                                .to_string(),
+                        ));
+                    }
+                    self.finalize_gc_tombstones(&journal.plan.tombstones)?;
+                    remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
                 }
-                GcPhase::Complete => {}
+                GcPhase::Complete => {
+                    remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
+                }
             }
             results.push(GcRecoveryResult {
                 gc_id: journal.plan.gc_id,
-                phase: journal.phase,
+                phase: match journal.phase {
+                    GcPhase::Planned | GcPhase::Moving => GcPhase::Planned,
+                    _ => GcPhase::Complete,
+                },
             });
         }
         Ok(results)
     }
 
-    fn finalize_gc_tombstones(&self) -> Result<()> {
-        let read_txn = self.db.begin_read()?;
-        let tombstones = read_txn.open_table(TOMBSTONES)?;
-        let mut tombstoned = Vec::new();
-        for item in tombstones.iter()? {
-            tombstoned.push(item?.0.value().to_string());
+    fn finalize_gc_tombstones(&self, planned: &[GcTombstone]) -> Result<()> {
+        match tombstone_set_status(&self.db, planned)? {
+            TombstoneSetStatus::Pending => {}
+            TombstoneSetStatus::Finalized => return Ok(()),
         }
-        drop(tombstones);
-        drop(read_txn);
-
-        for backup_id in &tombstoned {
+        for tombstone in planned {
+            validate_backup_id(&tombstone.backup_id)?;
+        }
+        for tombstone in planned {
             let manifest = self
                 .root
                 .join(REPO_MANIFESTS_DIR)
-                .join(format!("{backup_id}.manifest"));
+                .join(format!("{}.manifest", tombstone.backup_id));
             match fs::remove_file(manifest) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -678,9 +738,17 @@ impl Repository {
         {
             let mut tombstones = write_txn.open_table(TOMBSTONES)?;
             let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
-            for backup_id in &tombstoned {
-                let _ = backups.remove(backup_id.as_str())?;
-                let _ = tombstones.remove(backup_id.as_str())?;
+            for tombstone in planned {
+                match tombstones.get(tombstone.backup_id.as_str())? {
+                    Some(value) if value.value() == tombstone.deleted_unix_ms => {}
+                    _ => {
+                        return Err(Error::GarbageCollection(
+                            "stale GC tombstone set".to_string(),
+                        ))
+                    }
+                }
+                let _ = backups.remove(tombstone.backup_id.as_str())?;
+                let _ = tombstones.remove(tombstone.backup_id.as_str())?;
             }
         }
         write_txn.commit()?;
@@ -760,6 +828,61 @@ impl Repository {
     }
 }
 
+fn ensure_gc_namespace_available(db: &Database, root: &Path, gc_id: &str) -> Result<()> {
+    let read_txn = db.begin_read()?;
+    let table = read_txn.open_table(GC_JOURNALS)?;
+    if table.get(gc_id)?.is_some() {
+        return Err(Error::GarbageCollection(
+            "GC journal ID already exists".to_string(),
+        ));
+    }
+    drop(table);
+    drop(read_txn);
+    if fs::symlink_metadata(root.join(REPO_TRASH_DIR).join(gc_id)).is_ok() {
+        return Err(Error::GarbageCollection(
+            "GC trash namespace already exists".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TombstoneSetStatus {
+    Pending,
+    Finalized,
+}
+
+fn tombstone_set_status(db: &Database, planned: &[GcTombstone]) -> Result<TombstoneSetStatus> {
+    let read_txn = db.begin_read()?;
+    let tombstones = read_txn.open_table(TOMBSTONES)?;
+    let backups = read_txn.open_table(TABLE_BACKUPS)?;
+    let mut current = Vec::new();
+    for item in tombstones.iter()? {
+        let (key, value) = item?;
+        validate_backup_id(key.value())?;
+        current.push(GcTombstone {
+            backup_id: key.value().to_string(),
+            deleted_unix_ms: value.value(),
+        });
+    }
+    current.sort();
+    if current == planned {
+        return Ok(TombstoneSetStatus::Pending);
+    }
+    if current.is_empty()
+        && planned.iter().all(|entry| {
+            backups
+                .get(entry.backup_id.as_str())
+                .is_ok_and(|value| value.is_none())
+        })
+    {
+        return Ok(TombstoneSetStatus::Finalized);
+    }
+    Err(Error::GarbageCollection(
+        "stale GC tombstone set".to_string(),
+    ))
+}
+
 fn persist_gc_journal(db: &Database, journal: &GcJournal) -> Result<()> {
     let bytes = journal.encode()?;
     let write_txn = db.begin_write()?;
@@ -768,6 +891,85 @@ fn persist_gc_journal(db: &Database, journal: &GcJournal) -> Result<()> {
         table.insert(journal.plan.gc_id.as_str(), bytes.as_slice())?;
     }
     write_txn.commit()?;
+    Ok(())
+}
+
+fn persist_gc_journal_durable(db: &Database, root: &Path, journal: &GcJournal) -> Result<()> {
+    persist_gc_journal(db, journal)?;
+    sync_database_parent(root)
+}
+
+fn remove_gc_journal(db: &Database, root: &Path, gc_id: &str) -> Result<()> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut table = write_txn.open_table(GC_JOURNALS)?;
+        let _ = table.remove(gc_id)?;
+    }
+    write_txn.commit()?;
+    sync_database_parent(root)
+}
+
+fn ensure_real_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::GarbageCollection(format!(
+            "GC path is not a real directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn create_and_sync_directory(parent: &Path, child: &Path) -> Result<()> {
+    ensure_real_directory(parent)?;
+    match fs::symlink_metadata(child) {
+        Ok(_) => ensure_real_directory(child),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(child)?;
+            sync_directory(parent)?;
+            ensure_real_directory(child)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn validate_gc_trash_parent(root: &Path, plan: &GcPlan, item: &ChunkMove) -> Result<()> {
+    let trash_root = root.join(REPO_TRASH_DIR);
+    let gc_root = trash_root.join(&plan.gc_id);
+    let prefix = item
+        .trash
+        .parent()
+        .and_then(Path::file_name)
+        .ok_or_else(|| Error::GarbageCollection("invalid GC trash prefix".to_string()))?;
+    ensure_real_directory(root)?;
+    ensure_real_directory(&trash_root)?;
+    ensure_real_directory(&gc_root)?;
+    ensure_real_directory(&gc_root.join(prefix))
+}
+
+fn ensure_gc_trash_parent(root: &Path, plan: &GcPlan, item: &ChunkMove) -> Result<()> {
+    ensure_real_directory(root)?;
+    let trash_root = root.join(REPO_TRASH_DIR);
+    create_and_sync_directory(root, &trash_root)?;
+    let gc_root = trash_root.join(&plan.gc_id);
+    create_and_sync_directory(&trash_root, &gc_root)?;
+    let prefix = item
+        .trash
+        .parent()
+        .and_then(Path::file_name)
+        .ok_or_else(|| Error::GarbageCollection("invalid GC trash prefix".to_string()))?;
+    create_and_sync_directory(&gc_root, &gc_root.join(prefix))?;
+    validate_gc_trash_parent(root, plan, item)
+}
+
+fn validate_regular_file(path: &Path, bytes: u64) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() != bytes {
+        return Err(Error::GarbageCollection(format!(
+            "GC file metadata mismatch: {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
@@ -785,9 +987,12 @@ fn rollback_gc_moves(root: &Path, plan: &GcPlan) -> Result<()> {
                 )))
             }
             (false, true) => {
-                if let Some(parent) = source.parent() {
-                    fs::create_dir_all(parent)?;
-                }
+                validate_gc_trash_parent(root, plan, item)?;
+                validate_regular_file(&trash, item.bytes)?;
+                let source_parent = source.parent().ok_or_else(|| {
+                    Error::GarbageCollection("invalid GC source parent".to_string())
+                })?;
+                ensure_real_directory(source_parent)?;
                 fs::rename(&trash, &source)?;
                 sync_directory(source.parent().unwrap_or(root))?;
                 sync_directory(trash.parent().unwrap_or(root))?;
@@ -817,12 +1022,16 @@ fn delete_gc_trash(root: &Path, plan: &GcPlan) -> Result<()> {
             )));
         }
         if source_exists {
-            if let Some(parent) = trash.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_gc_trash_parent(root, plan, item)?;
+            validate_regular_file(&source, item.bytes)?;
+            validate_gc_trash_parent(root, plan, item)?;
             fs::rename(&source, &trash)?;
             sync_directory(source.parent().unwrap_or(root))?;
             sync_directory(trash.parent().unwrap_or(root))?;
+        }
+        if trash_exists {
+            validate_gc_trash_parent(root, plan, item)?;
+            validate_regular_file(&trash, item.bytes)?;
         }
         match fs::remove_file(&trash) {
             Ok(()) => sync_directory(trash.parent().unwrap_or(root))?,
@@ -833,8 +1042,14 @@ fn delete_gc_trash(root: &Path, plan: &GcPlan) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -887,6 +1102,51 @@ fn validate_gc_journal_plan(plan: &GcPlan, root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn validate_stored_chunk_file(path: &Path, item: &ChunkMove) -> Result<()> {
+    use crate::codec::{STORED_CHUNK_HEADER_LEN, STORED_CHUNK_MAGIC, STORED_CHUNK_VERSION};
+
+    let mut file = File::open(path)?;
+    let mut header = [0_u8; STORED_CHUNK_HEADER_LEN];
+    file.read_exact(&mut header)
+        .map_err(|error| Error::ChunkCorrupt {
+            content_id: item.content_id.clone(),
+            reason: error.to_string(),
+        })?;
+    if &header[..8] != STORED_CHUNK_MAGIC {
+        return Err(Error::ChunkCorrupt {
+            content_id: item.content_id.clone(),
+            reason: "invalid stored chunk magic".to_string(),
+        });
+    }
+    let version =
+        u32::from_le_bytes(header[8..12].try_into().map_err(|_| Error::ChunkCorrupt {
+            content_id: item.content_id.clone(),
+            reason: "invalid stored chunk version".to_string(),
+        })?);
+    if version != STORED_CHUNK_VERSION {
+        return Err(Error::ChunkCorrupt {
+            content_id: item.content_id.clone(),
+            reason: "unsupported stored chunk version".to_string(),
+        });
+    }
+    CompressionCodec::from_tag(header[12]).map_err(|error| Error::ChunkCorrupt {
+        content_id: item.content_id.clone(),
+        reason: error.to_string(),
+    })?;
+    let payload_len =
+        u64::from_le_bytes(header[16..24].try_into().map_err(|_| Error::ChunkCorrupt {
+            content_id: item.content_id.clone(),
+            reason: "invalid stored chunk payload length".to_string(),
+        })?);
+    if payload_len.checked_add(STORED_CHUNK_HEADER_LEN as u64) != Some(item.bytes) {
+        return Err(Error::ChunkCorrupt {
+            content_id: item.content_id.clone(),
+            reason: "stored chunk length mismatch".to_string(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_gc_plan(plan: &GcPlan, current: &GcPlan, root: &Path) -> Result<()> {
     validate_gc_journal_plan(plan, root)?;
     if plan.reclaim_bytes
@@ -903,6 +1163,7 @@ fn validate_gc_plan(plan: &GcPlan, current: &GcPlan, root: &Path) -> Result<()> 
     if plan.live_chunks != current.live_chunks
         || plan.reclaim_chunks.len() != current.reclaim_chunks.len()
         || plan.reclaim_bytes != current.reclaim_bytes
+        || plan.tombstones != current.tombstones
     {
         return Err(Error::GarbageCollection("stale GC plan".to_string()));
     }
@@ -940,11 +1201,7 @@ fn validate_gc_plan(plan: &GcPlan, current: &GcPlan, root: &Path) -> Result<()> 
                 item.content_id
             )));
         }
-        let bytes = fs::read(&source)?;
-        StoredChunk::decode(&bytes).map_err(|error| Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: error.to_string(),
-        })?;
+        validate_stored_chunk_file(&source, item)?;
     }
     Ok(())
 }
@@ -968,9 +1225,15 @@ fn unix_ms() -> u64 {
 }
 
 fn getrandom_hex(bytes_len: usize) -> String {
+    getrandom_hex_result(bytes_len).unwrap_or_default()
+}
+
+fn getrandom_hex_result(bytes_len: usize) -> Result<String> {
     let mut buf = vec![0u8; bytes_len];
-    let _ = getrandom::fill(&mut buf);
-    hex::encode(buf)
+    getrandom::fill(&mut buf).map_err(|error| {
+        Error::GarbageCollection(format!("random ID generation failed: {error}"))
+    })?;
+    Ok(hex::encode(buf))
 }
 
 #[cfg(test)]
@@ -1038,6 +1301,6 @@ mod gc_fault_tests {
             reopened.plan_undelete("backup-fault"),
             Err(Error::BackupNotFound(_))
         ));
-        assert_eq!(reopened.recover_gc().unwrap()[0].phase, GcPhase::Complete);
+        assert!(reopened.recover_gc().unwrap().is_empty());
     }
 }
