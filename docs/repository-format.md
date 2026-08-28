@@ -11,6 +11,7 @@ Format version: `2`
   .lock                   # exclusive OS flock (survives crash without manual cleanup)
   chunks/<aa>/<rest>      # immutable compressed chunk files
   manifests/<id>.manifest # published manifests
+  trash/<gc-id>/<aa>/<rest> # same-filesystem GC staging
   tmp/                    # temporary files, never listed as backups
 ```
 
@@ -94,6 +95,35 @@ Tombstoning never modifies completed backup bytes or chunk files. A crash after
 the file rename but before the database commit cannot expose an unfinished
 backup. A crash after the database commit but before the file rename still
 leaves the backup visible, because the authoritative copy is in redb.
+
+## Garbage collection journal
+
+Garbage collection is tombstone-based and split into deterministic plan/apply operations.
+`plan_gc` marks chunks from one redb snapshot of `backups` and `tombstones`; malformed
+manifests, missing live chunks, or unexpected chunk inventory names fail closed. Plans use
+repository-relative canonical `chunks/<aa>/<rest>` and `trash/<gc-id>/<aa>/<rest>` paths.
+`apply_gc` rechecks active reader leases and every planned path, content ID, byte count, and
+current live-set before mutation. It is a caller-held writer-lock primitive and never acquires
+a nested writer lock.
+
+The `gc_journals` redb table stores bounded JSON `GcJournal` DTOs. Each journal contains its
+`GcPlan`, phase, and the content IDs durably recorded as moved. Move progress is committed in
+batches of exactly 128, with a final short batch. Journal state is synced before filesystem
+moves and every phase transition. Chunk moves are same-filesystem renames; affected files and
+directories are synced after rename and deletion.
+
+Phases have these crash semantics:
+
+- `Planned`: no committed deletion point; recovery restores any chunk found in trash.
+- `Moving`: recovery rolls every moved or rename-before-journal-update chunk back to `chunks/`.
+- `Committed`: deletion is irrevocable; recovery rolls forward from source or trash.
+- `Deleting`: recovery continues trash deletion, tombstone/index finalization, and manifest-copy removal.
+- `Complete`: recovery is idempotent and reports the completed journal without mutation.
+
+Recovery never overwrites an existing source or trash destination. Dual copies are corruption.
+After `Committed`, authoritative `backups` and `tombstones` entries are removed consistently and
+the human-readable manifest copy is deleted, preventing undelete of a finalized backup. Chunks
+still referenced by any valid non-tombstoned manifest remain live.
 
 ## Compatibility
 

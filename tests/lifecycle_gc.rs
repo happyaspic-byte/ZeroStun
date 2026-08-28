@@ -197,3 +197,417 @@ fn insert_lease(repo_path: &std::path::Path, lease: &zerostun::ReaderLease) {
     }
     write.commit().unwrap();
 }
+
+fn commit_payloads(repo: &Repository, backup_id: &str, payloads: &[&[u8]]) -> Vec<String> {
+    use zerostun::hash::{content_id_from_bytes, root_hash_from_manifest};
+    use zerostun::manifest::{ChunkDescriptor, Manifest};
+
+    let mut manifest = Manifest::new(backup_id, 0, 64, 128, 256);
+    let mut offset = 0_u64;
+    let mut ids = Vec::new();
+    for (index, payload) in payloads.iter().enumerate() {
+        let cid = content_id_from_bytes(payload);
+        repo.write_chunk(&cid, CompressionCodec::None, payload)
+            .unwrap();
+        manifest.add_chunk(ChunkDescriptor {
+            index: index as u64,
+            logical_offset: offset,
+            original_length: payload.len() as u64,
+            stored_length: payload.len() as u64,
+            codec: CompressionCodec::None,
+            content_id: cid,
+        });
+        offset += payload.len() as u64;
+        ids.push(cid.to_hex());
+    }
+    manifest.total_logical_bytes = offset;
+    manifest.root_hash = root_hash_from_manifest(&manifest);
+    repo.commit_manifest(&manifest).unwrap();
+    ids
+}
+
+#[test]
+fn gc_preserves_chunks_referenced_by_live_backup() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let first = commit_payloads(&repo, "backup-first", &[b"first", b"shared"]);
+    let second = commit_payloads(&repo, "backup-second", &[b"shared", b"second"]);
+    repo.apply_delete(&repo.plan_delete("backup-first").unwrap())
+        .unwrap();
+
+    let plan = repo.plan_gc().unwrap();
+
+    assert!(plan
+        .reclaim_chunks
+        .iter()
+        .any(|item| item.content_id == first[0]));
+    assert!(!plan
+        .reclaim_chunks
+        .iter()
+        .any(|item| item.content_id == first[1]));
+    repo.apply_gc(&plan).unwrap();
+    let shared = zerostun::ids::ContentId::parse(&second[0]).unwrap();
+    assert!(repo.read_chunk(&shared).is_ok());
+}
+
+#[test]
+fn gc_reclaims_last_reference_and_orphan() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let owned = commit_payloads(&repo, "backup-only", &[b"owned-a", b"owned-b"]);
+    let orphan = zerostun::hash::content_id_from_bytes(b"orphan");
+    repo.write_chunk(&orphan, CompressionCodec::None, b"orphan")
+        .unwrap();
+    repo.apply_delete(&repo.plan_delete("backup-only").unwrap())
+        .unwrap();
+
+    let plan = repo.plan_gc().unwrap();
+
+    assert_eq!(plan.reclaim_chunks.len(), owned.len() + 1);
+    assert!(plan
+        .reclaim_chunks
+        .windows(2)
+        .all(|pair| pair[0].content_id < pair[1].content_id));
+    let result = repo.apply_gc(&plan).unwrap();
+    assert_eq!(result.reclaimed_chunks, plan.reclaim_chunks.len() as u64);
+    assert_eq!(result.reclaimed_bytes, plan.reclaim_bytes);
+    assert!(repo.plan_undelete("backup-only").is_err());
+}
+
+#[test]
+fn gc_refuses_active_reader_lease_at_plan_and_apply() {
+    let fixture = futures_lite_backup_fixture();
+    let guard = fixture
+        .repo
+        .acquire_reader_lease(&fixture.backup_id)
+        .unwrap();
+    let error = fixture.repo.plan_gc().unwrap_err();
+    assert!(error.to_string().contains("active reader"));
+    drop(guard);
+    let plan = fixture.repo.plan_gc().unwrap();
+    let _guard = fixture
+        .repo
+        .acquire_reader_lease(&fixture.backup_id)
+        .unwrap();
+    let error = fixture.repo.apply_gc(&plan).unwrap_err();
+    assert!(error.to_string().contains("active reader"));
+}
+
+fn futures_lite_backup_fixture() -> BackupFixture {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(backup_fixture())
+}
+
+#[test]
+fn gc_plan_rejects_corrupt_live_manifest_and_unexpected_chunk_names() {
+    const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    drop(repo);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut backups = write.open_table(BACKUPS).unwrap();
+        backups
+            .insert("backup-corrupt", b"corrupt".as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    let repo = Repository::open(&repo_path).unwrap();
+    assert!(matches!(repo.plan_gc(), Err(Error::ManifestCorrupt(_))));
+    drop(repo);
+
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut backups = write.open_table(BACKUPS).unwrap();
+        backups.remove("backup-corrupt").unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    std::fs::write(repo_path.join("chunks").join("unexpected"), b"data").unwrap();
+    let repo = Repository::open(&repo_path).unwrap();
+    assert!(repo
+        .plan_gc()
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected chunk"));
+
+    std::fs::remove_file(repo_path.join("chunks").join("unexpected")).unwrap();
+    std::fs::create_dir(repo_path.join("chunks").join("AA")).unwrap();
+    assert!(repo
+        .plan_gc()
+        .unwrap_err()
+        .to_string()
+        .contains("unexpected chunk"));
+}
+
+#[test]
+fn gc_fails_closed_for_corrupt_tombstoned_manifest() {
+    const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    drop(repo);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut backups = write.open_table(BACKUPS).unwrap();
+        backups
+            .insert("backup-corrupt-deleted", b"corrupt".as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    let repo = Repository::open(&repo_path).unwrap();
+    repo.apply_delete(&repo.plan_delete("backup-corrupt-deleted").unwrap())
+        .unwrap();
+
+    assert!(matches!(repo.plan_gc(), Err(Error::ManifestCorrupt(_))));
+}
+
+#[test]
+fn gc_reports_missing_live_chunk_instead_of_ignoring_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let ids = commit_payloads(&repo, "backup-live-missing", &[b"missing"]);
+    let cid = zerostun::ids::ContentId::parse(&ids[0]).unwrap();
+    std::fs::remove_file(repo.chunk_path(&cid)).unwrap();
+
+    assert!(matches!(
+        repo.plan_gc(),
+        Err(Error::ChunkMissing { content_id }) if content_id == ids[0]
+    ));
+}
+
+#[test]
+fn apply_rejects_forged_paths_metadata_and_stale_plan_before_mutation() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let ids = commit_payloads(&repo, "backup-doomed", &[b"owned"]);
+    repo.apply_delete(&repo.plan_delete("backup-doomed").unwrap())
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let source = repo.root().join(&plan.reclaim_chunks[0].source);
+    let original = std::fs::read(&source).unwrap();
+
+    for mutate in 0..6 {
+        let mut forged = plan.clone();
+        match mutate {
+            0 => forged.reclaim_chunks[0].source = std::path::PathBuf::from("../outside"),
+            1 => forged.reclaim_chunks[0].trash = std::path::PathBuf::from("../outside"),
+            2 => forged.reclaim_chunks[0].bytes += 1,
+            3 => forged.reclaim_chunks[0].content_id = "00".repeat(32),
+            4 => forged.live_chunks += 1,
+            _ => forged.reclaim_chunks.push(forged.reclaim_chunks[0].clone()),
+        }
+        assert!(repo.apply_gc(&forged).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+    }
+
+    let live = commit_payloads(&repo, "backup-new-live", &[b"owned"]);
+    assert_eq!(live, ids);
+    assert!(repo.apply_gc(&plan).is_err());
+    assert!(source.exists());
+    assert_eq!(ids.len(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_rejects_chunk_symlink_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"orphan");
+    repo.write_chunk(&cid, CompressionCodec::None, b"orphan")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let path = repo.chunk_path(&cid);
+    let external = temp.path().join("external");
+    std::fs::write(&external, b"external").unwrap();
+    std::fs::remove_file(&path).unwrap();
+    symlink(&external, &path).unwrap();
+
+    assert!(repo.apply_gc(&plan).is_err());
+    assert_eq!(std::fs::read(external).unwrap(), b"external");
+}
+
+#[test]
+fn init_creates_gc_journal_table_but_open_does_not() {
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    drop(repo);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let read = db.begin_read().unwrap();
+    assert!(read.open_table(GC_JOURNALS).is_ok());
+}
+
+#[test]
+fn gc_finalizes_tombstone_manifest_and_index() {
+    const BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+    const TOMBSTONES: TableDefinition<&str, u64> = TableDefinition::new("tombstones");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    commit_payloads(&repo, "backup-final", &[b"final"]);
+    repo.apply_delete(&repo.plan_delete("backup-final").unwrap())
+        .unwrap();
+    repo.apply_gc(&repo.plan_gc().unwrap()).unwrap();
+    drop(repo);
+
+    assert!(!repo_path.join("manifests/backup-final.manifest").exists());
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let read = db.begin_read().unwrap();
+    assert!(read
+        .open_table(BACKUPS)
+        .unwrap()
+        .get("backup-final")
+        .unwrap()
+        .is_none());
+    assert!(read
+        .open_table(TOMBSTONES)
+        .unwrap()
+        .get("backup-final")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn recover_gc_rolls_back_uncommitted_moves_from_fresh_open() {
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"orphan");
+    repo.write_chunk(&cid, CompressionCodec::None, b"orphan")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let trash = repo.root().join(&item.trash);
+    std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    std::fs::rename(repo.root().join(&item.source), &trash).unwrap();
+    let journal = GcJournal {
+        plan: plan.clone(),
+        phase: GcPhase::Moving,
+        moved: Vec::new(),
+    };
+    drop(repo);
+    insert_journal(&repo_path, &journal, GC_JOURNALS);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    let recovered = reopened.recover_gc().unwrap();
+    assert_eq!(recovered[0].phase, GcPhase::Planned);
+    assert!(reopened.chunk_path(&cid).exists());
+    assert!(!trash.exists());
+    assert_eq!(reopened.recover_gc().unwrap()[0].phase, GcPhase::Planned);
+}
+
+#[test]
+fn recover_gc_reports_missing_uncommitted_chunk() {
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"missing-orphan");
+    repo.write_chunk(&cid, CompressionCodec::None, b"missing-orphan")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    std::fs::remove_file(repo.chunk_path(&cid)).unwrap();
+    let journal = GcJournal {
+        plan,
+        phase: GcPhase::Moving,
+        moved: vec![cid.to_hex()],
+    };
+    drop(repo);
+    insert_journal(&repo_path, &journal, GC_JOURNALS);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    assert!(reopened
+        .recover_gc()
+        .unwrap_err()
+        .to_string()
+        .contains("missing source and trash"));
+}
+
+#[test]
+fn recover_gc_rolls_forward_committed_work_from_fresh_open() {
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"orphan");
+    repo.write_chunk(&cid, CompressionCodec::None, b"orphan")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let trash = repo.root().join(&item.trash);
+    std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    std::fs::rename(repo.root().join(&item.source), &trash).unwrap();
+    let journal = GcJournal {
+        plan: plan.clone(),
+        phase: GcPhase::Committed,
+        moved: vec![cid.to_hex()],
+    };
+    drop(repo);
+    insert_journal(&repo_path, &journal, GC_JOURNALS);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    let recovered = reopened.recover_gc().unwrap();
+    assert_eq!(recovered[0].phase, GcPhase::Complete);
+    assert!(!reopened.chunk_path(&cid).exists());
+    assert!(!trash.exists());
+    assert_eq!(reopened.recover_gc().unwrap()[0].phase, GcPhase::Complete);
+}
+
+fn insert_journal(
+    repo_path: &std::path::Path,
+    journal: &zerostun::GcJournal,
+    table: TableDefinition<&str, &[u8]>,
+) {
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let bytes = journal.encode().unwrap();
+        let mut journals = write.open_table(table).unwrap();
+        journals
+            .insert(journal.plan.gc_id.as_str(), bytes.as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+}
+
+#[test]
+fn gc_plan_and_journal_json_are_stable_and_bounded() {
+    use zerostun::{GcJournal, GcPhase};
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"orphan");
+    repo.write_chunk(&cid, CompressionCodec::None, b"orphan")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let value = serde_json::to_value(&plan).unwrap();
+    assert_eq!(
+        serde_json::from_value::<zerostun::GcPlan>(value).unwrap(),
+        plan
+    );
+    let journal = GcJournal {
+        plan,
+        phase: GcPhase::Moving,
+        moved: vec![cid.to_hex()],
+    };
+    let bytes = journal.encode().unwrap();
+    assert_eq!(GcJournal::decode(&bytes).unwrap(), journal);
+    assert!(GcJournal::decode(&vec![0; 17 * 1024 * 1024]).is_err());
+}

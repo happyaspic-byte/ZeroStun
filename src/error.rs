@@ -95,6 +95,9 @@ pub enum Error {
 
     #[error("database error: {0}")]
     Database(String),
+
+    #[error("garbage collection error: {0}")]
+    GarbageCollection(String),
 }
 
 impl From<redb::Error> for Error {
