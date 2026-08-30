@@ -17,7 +17,7 @@ ZeroStun is a single CLI binary with library modules that have one responsibilit
 | `manifest` | versioned encoding of backup metadata |
 | `rate_limit` | deficit token bucket for bytes/sec and optional IOPS |
 | `telemetry` | progress mode and job stats |
-| `snapshot` | object-safe snapshot providers, exact-argv command runner, LVM and ZFS adapters |
+| `snapshot` | object-safe snapshot providers, exact-argv command runner, typed HTTP transport, LVM, ZFS, Proxmox, and Stratus adapters |
 | `daemon` | TOML job admission, injected-clock scheduler, retry classification, SIGTERM shutdown, redb job/run state |
 
 ## Backup pipeline

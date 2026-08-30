@@ -1,0 +1,12 @@
+{
+  "appliance": "everrun",
+  "pair": {
+    "nodes": ["node-a", "node-b"],
+    "role": ["primary", "secondary"],
+    "sync": "syncing"
+  },
+  "ft": {
+    "state": "degraded",
+    "synchronized": false
+  }
+}

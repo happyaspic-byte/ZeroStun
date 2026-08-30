@@ -1,0 +1,12 @@
+{
+  "appliance": "ztc",
+  "cluster": {
+    "nodes": ["ztc-1", "ztc-2"],
+    "quorum": true
+  },
+  "ha": {
+    "mode": "ft",
+    "synchronized": true,
+    "state": "protected"
+  }
+}

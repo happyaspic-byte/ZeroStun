@@ -24,7 +24,7 @@ so backups can be verified and restored byte-for-byte.
 - Crash-consistent snapshots of live files
 - Encryption, signatures, or remote authentication
 - Network replication, S3, or regulatory WORM enforcement
-- Proxmox, everRun, or ztC integration
+- Hardware-verified Proxmox, everRun, or ztC integration
 
 Rate limits bound backup I/O. They are not a proof that another process on the
 same host will never stall. See `docs/zero-stun-contract.md`.
@@ -36,14 +36,17 @@ same host will never stall. See `docs/zero-stun-contract.md`.
 | LVM | Read-only logical-volume snapshot at a stable `/dev/mapper` path | `contract-tested` | Exact-argv `lvs`/`lvcreate`/`lvremove`, tagged stale-snapshot recovery; no disposable root storage lab was available |
 | ZFS filesystem | Read-only clone mounted under `/run/zerostun/zfs` | `contract-tested` | Snapshot, clone, mount, reverse cleanup, and stale-resource recovery are fault-injected |
 | ZFS ZVOL | Read-only clone exposed under `/dev/zvol` | `contract-tested` | Block-device lifecycle is separated from filesystem mount semantics |
-| Proxmox | Not implemented | unsupported | Planned production provider |
-| everRun / ztC | Not implemented | unsupported | Planned hardware providers |
+| Proxmox | Derived read-only VM snapshot path under `/dev/pve` | `contract-tested` | Typed HTTP transport, token from env or mode-0600 file, VM/storage probe, ownership-bound cleanup; no disposable lab was configured |
+| everRun | Derived read-only workload snapshot path under `/dev/stratus` | `contract-tested` | Explicit everRun schema, FT synchronization probe, mutation refused while unsynchronized |
+| ztC | Derived read-only workload snapshot path under `/dev/stratus` | `contract-tested` | Explicit ztC schema, node-pair/quorum probe, same lifecycle as everRun with a distinct API prefix |
 
-`contract-tested` means provider commands, parsing, failures, timeout,
-cancellation, redaction, validation, and recovery are verified against a fake
-exact-argv runner. It does not claim integration or hardware verification.
-This host had non-root LVM tooling and no ZFS binary, so only non-destructive
-availability probes were run; no host storage was modified.
+`contract-tested` means provider commands or HTTP requests, parsing, failures,
+timeout, cancellation, redaction, validation, and recovery are verified against
+a fake exact-argv runner or typed HTTP transport. It does not claim integration
+or hardware verification. This host had non-root LVM tooling and no ZFS binary,
+so only non-destructive availability probes were run; no host storage was
+modified. No Proxmox or Stratus lab credentials or isolated disposable targets
+were configured, so no live API mutation was attempted.
 
 ## Build
 

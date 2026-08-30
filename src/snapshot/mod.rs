@@ -6,15 +6,24 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 
+mod http;
 mod lvm;
+mod proxmox;
 mod runner;
+mod stratus;
 mod zfs;
 
+pub use http::{
+    ApiAuth, FakeHttpScript, FakeHttpTransport, HttpMethod, HttpRequest, HttpResponse,
+    HttpTransport, MAX_HTTP_BODY_BYTES,
+};
 pub use lvm::LvmProvider;
+pub use proxmox::{ProxmoxConfig, ProxmoxProvider};
 pub use runner::{
     redact_text, BoxFuture, CommandOutput, CommandRunner, CommandSpec, FakeRunner,
     FakeRunnerScript, ProcessRunner, RecordedCommand, MAX_COMMAND_OUTPUT_BYTES,
 };
+pub use stratus::{ApplianceKind, StratusConfig, StratusProvider};
 pub use zfs::{ZfsProvider, ZfsTargetCapabilities, ZfsTargetKind};
 
 pub(crate) const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
