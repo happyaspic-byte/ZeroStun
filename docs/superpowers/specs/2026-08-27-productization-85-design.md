@@ -2,6 +2,20 @@
 
 Date: 2026-08-27
 Status: Approved
+Last scorecard: 2026-08-30
+
+Current evidence-based score is **40/100**:
+
+| Area | Weight | Earned | Evidence |
+| --- | ---: | ---: | --- |
+| Core backup engine | 25 | 25 | Round-trip, integrity, bounded pipeline, CI |
+| Repository lifecycle | 15 | 15 | `docs/qualification/repository-lifecycle.md` |
+| Snapshot adapters | 25 | 0 | Not implemented |
+| Operations | 15 | 0 | No daemon |
+| Distribution | 10 | 0 | No release archives/SBOM |
+| Reliability/security | 10 | 0 | Fault tests exist for lifecycle; product gate still requires soak/release/audit completeness |
+
+Lifecycle 15 is earned only for the local repository product. Platforms remain unverified. 85/100 still requires daemon, distribution, and reliability end-to-end.
 
 ## 1. Objective
 

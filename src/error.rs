@@ -47,6 +47,12 @@ pub enum Error {
     #[error("backup not found: {0}")]
     BackupNotFound(String),
 
+    #[error("backup already exists: {0}")]
+    BackupAlreadyExists(String),
+
+    #[error("backup has been deleted: {0}")]
+    BackupDeleted(String),
+
     #[error("chunk {content_id} is missing from the repository")]
     ChunkMissing { content_id: String },
 
@@ -89,6 +95,36 @@ pub enum Error {
 
     #[error("database error: {0}")]
     Database(String),
+
+    #[error("garbage collection error: {0}")]
+    GarbageCollection(String),
+
+    #[error("lifecycle plan is stale: {0}")]
+    StalePlan(String),
+
+    #[error("active reader: {0}")]
+    ActiveReader(String),
+
+    #[error("critical repair finding: {0}")]
+    CriticalRepair(String),
+
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+
+    #[error("daemon error: {0}")]
+    Daemon(String),
+
+    #[error("daemon shutdown exceeded its cleanup deadline")]
+    ShutdownDeadline,
+
+    #[error("daemon run {run_id} is not a running job")]
+    RunNotActive { run_id: String },
+
+    #[error("daemon job {job_id} already has an active run")]
+    JobAlreadyRunning { job_id: String },
+
+    #[error("daemon configuration error: {0}")]
+    InvalidDaemonConfig(String),
 }
 
 impl From<redb::Error> for Error {
@@ -143,13 +179,16 @@ pub enum ExitCode {
 impl Error {
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Error::InvalidConfig(_) | Error::InvalidIdentifier(_) | Error::PathTraversal(_) => {
-                ExitCode::InvalidConfig
-            }
+            Error::InvalidConfig(_)
+            | Error::InvalidDaemonConfig(_)
+            | Error::InvalidIdentifier(_)
+            | Error::PathTraversal(_) => ExitCode::InvalidConfig,
             Error::RepositoryNotInitialized(_)
             | Error::NotARepository(_)
             | Error::UnsupportedRepositoryVersion { .. }
-            | Error::BackupNotFound(_) => ExitCode::Repository,
+            | Error::BackupNotFound(_)
+            | Error::BackupAlreadyExists(_)
+            | Error::BackupDeleted(_) => ExitCode::Repository,
             Error::RepositoryLocked(_) => ExitCode::Locked,
             Error::SourceChanged(_) => ExitCode::SourceChanged,
             Error::ChunkMissing { .. }
@@ -158,6 +197,18 @@ impl Error {
             | Error::RootHashMismatch { .. } => ExitCode::Integrity,
             Error::RestoreTargetExists(_) => ExitCode::TargetExists,
             Error::Cancelled => ExitCode::Cancelled,
+            Error::StalePlan(_) => ExitCode::Repository,
+            Error::ActiveReader(_) => ExitCode::Locked,
+            Error::CriticalRepair(_) => ExitCode::Integrity,
+            Error::GarbageCollection(message) => {
+                if message.contains("active reader") {
+                    ExitCode::Locked
+                } else if message.contains("stale") {
+                    ExitCode::Repository
+                } else {
+                    ExitCode::Generic
+                }
+            }
             _ => ExitCode::Generic,
         }
     }

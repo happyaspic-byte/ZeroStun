@@ -1,0 +1,237 @@
+goal:
+  id: zerostun-production-complete
+  name: "ZeroStun 최종 제품 완성"
+  mission: "ZeroStun을 로컬 백업 MVP에서 배포·운영·복구·플랫폼 검증이 가능한 프로덕션 백업 제품으로 완성한다."
+  repository: "https://github.com/happyaspic-byte/ZeroStun"
+  local_repository: "/home/ubuntu/projects/ZeroStun"
+  target_branch: main
+  minimum_product_score: 85
+  target_product_score: 100
+  execution_mode: autonomous
+  orchestration: workflow-agent-team
+  human_role: final-review-only
+
+current_state:
+  verify_before_execution: true
+  expected_feature_branch: worktree-zerostun-core
+  expected_pull_request: 1
+  last_known_head: 5b66d57
+  evidence_score: 40
+  completed[2]:
+    - "Phase 1: repository lifecycle, repair, CLI, fault recovery"
+    - "Phase 2 foundation: SnapshotProvider contract, typed runner, fake provider"
+  note: "현재 상태가 다르면 저장소와 GitHub의 실제 상태를 기준으로 갱신한다."
+
+authority:
+  delegated_role: "repository owner and product maintainer"
+  authorized_actions[9]:
+    - "코드·테스트·문서 작성과 수정"
+    - "기능 브랜치 생성과 전환"
+    - "새 커밋 생성"
+    - "기능 브랜치 push"
+    - "PR 생성·수정·리뷰"
+    - "모든 품질 게이트 통과 후 PR 병합"
+    - "GitHub Actions와 릴리스 워크플로 수정"
+    - "완성 게이트 통과 후 semver 태그와 GitHub Release 생성"
+    - "이 목표 수행 중 생성한 임시 파일과 빌드 산출물 정리"
+  prohibited_actions[7]:
+    - "main 또는 master 강제 push"
+    - "force push"
+    - "테스트·서명·보안 훅 우회"
+    - "사용자 작업 또는 출처 불명 파일 삭제"
+    - "자격증명을 코드·로그·CLI 인수·JSON에 기록"
+    - "실장비 검증 없이 플랫폼 지원 완료 선언"
+    - "실패한 테스트를 삭제하거나 완화하여 통과 처리"
+
+communication:
+  progress_reports: false
+  intermediate_summaries: false
+  routine_questions: false
+  notify_on[2]:
+    - final_completion
+    - external_blocker_terminal
+  blocker_policy:
+    continue_independent_work: true
+    aggregate_external_blockers: true
+    request_input_only_when: "자격증명·실장비·권한 등 인간만 해결 가능한 항목 때문에 모든 남은 작업이 막혔을 때"
+    maximum_requests: 1
+  final_report_language: ko
+  final_report_contents[8]:
+    - "완료된 기능과 지원 플랫폼"
+    - "최종 제품 점수와 근거"
+    - "main 병합 커밋과 릴리스 버전"
+    - "PR·CI·릴리스 URL"
+    - "테스트 수와 품질 게이트 결과"
+    - "실장비 및 soak 검증 결과"
+    - "알려진 제한과 잔여 위험"
+    - "설치·실행·복구 핵심 명령"
+
+engineering_policy:
+  methodology: TDD
+  test_sequence[3]: RED,GREEN,REFACTOR
+  change_policy: "한 번에 하나의 검증 가능한 동작을 구현한다."
+  review_policy:
+    independent_review: true
+    adversarial_verification: true
+    fix_severities[2]: critical,important
+    regression_test_required: true
+    dry_rounds_required: 2
+  security_policy[7]:
+    - "외부 명령은 program과 argv를 분리한다."
+    - "셸 문자열 보간을 금지한다."
+    - "출력 크기·timeout·취소를 강제한다."
+    - "자격증명과 토큰을 완전히 마스킹한다."
+    - "파일 경로와 symlink 경계를 검증한다."
+    - "파괴 작업은 기본 dry-run, 명시적 --apply만 허용한다."
+    - "누락·손상 데이터는 보고하되 절대 생성하거나 추정하지 않는다."
+  git_policy:
+    worktree_isolation: true
+    commit_style: conventional
+    commit_after_verified_unit: true
+    merge_only_when_green: true
+    direct_main_push: false
+    delete_branch_after_merge: true
+  temporary_file_policy:
+    preferred_directory: "$CLAUDE_JOB_DIR/tmp"
+    cleanup_created_files: true
+    preserve_unknown_files: true
+
+phases[8]{id,name,outcome,acceptance}:
+  0,"기준선 안정화","열린 PR과 브랜치 상태를 검증하고 이미 완료된 작업을 안전하게 main에 통합","CI 성공, 검증된 병합 차단 0개, main 병합 완료"
+  1,"Repository Lifecycle","delete·retention·lease·GC·repair·CLI·crash recovery 완성","qualification 통과, 데이터 손실 회귀 0개"
+  2,"Snapshot Abstraction","SnapshotProvider·CommandSpec·runner·fake provider·contract suite 완성","성공 및 모든 주입 실패 계약 통과, argv 정확, secret 유출 0"
+  3,"LVM and ZFS","LVM·ZFS provider와 안전한 cleanup/recover 구현","contract-tested 완료, 가능한 환경에서 integration-tested"
+  4,"Daemon and Operations","scheduler·retry·cancel·restart recovery·metrics·systemd 구현","중복 실행 0, restart/cancel/retry/shutdown 테스트 통과"
+  5,"Proxmox and Stratus","Proxmox·everRun·ztC provider와 redacted fixture 계약 구현","contract-tested 완료, 사용 가능한 랩에서 hardware-verified"
+  6,"Distribution","GNU/musl archive·checksum·SBOM·completion·man·systemd package·release 구현","태그 기반 재현 가능한 설치 아카이브와 검증된 SBOM"
+  7,"Reliability Qualification","24시간 soak·process kill·disk full·권한·손상·timeout·restart·성능 검증","데이터 손실 0, orphan snapshot 0, 모든 결과 문서화"
+
+phase_3_requirements:
+  lvm[7]:
+    - "lvs --reportformat json probe"
+    - "read-only lvcreate snapshot"
+    - "stable source path"
+    - "reverse-order cleanup"
+    - "interrupted snapshot recovery"
+    - "unsupported capability fail-closed"
+    - "real disposable environment test when available"
+  zfs[7]:
+    - "machine-readable zfs probe"
+    - "filesystem과 ZVOL capability 구분"
+    - "snapshot·clone·mount lifecycle"
+    - "reverse-order cleanup"
+    - "stale resource recovery"
+    - "mixed semantic target 사전 거부"
+    - "real disposable environment test when available"
+
+phase_4_requirements:
+  components[5]: config,state,scheduler,runner,shutdown
+  commands[5]: "daemon status","jobs list","runs list","cancel <run-id>","metrics --json"
+  behaviors[10]:
+    - "TOML job configuration"
+    - "UTC 또는 IANA timezone"
+    - "동일 job 동시 실행 금지"
+    - "재시작 후 최대 1회 missed-run catch-up"
+    - "transient error에만 bounded exponential retry"
+    - "SIGTERM admission stop"
+    - "실행 중 작업 취소"
+    - "snapshot cleanup 후 상태 commit"
+    - "cleanup 실패 복구 레코드"
+    - "hardened systemd unit"
+
+phase_5_requirements:
+  proxmox[5]:
+    - "API token transport 분리"
+    - "VM/storage capability probe"
+    - "snapshot lifecycle"
+    - "redacted schema fixtures"
+    - "실장비 전에는 contract-tested로만 표시"
+  stratus[6]:
+    - "everRun과 ztC API transport 분리"
+    - "node-pair 상태 probe"
+    - "FT synchronization 안전성 검사"
+    - "unsafe synchronization 중 snapshot 거부"
+    - "redacted fixtures"
+    - "실제 장비 검증 전에는 hardware-supported 선언 금지"
+
+phase_6_artifacts[8]:
+  - "Linux x86_64 GNU archive"
+  - "Linux x86_64 musl archive"
+  - "SHA-256 checksum file"
+  - "CycloneDX SBOM"
+  - "shell completions"
+  - "man page"
+  - "systemd unit and sample configuration"
+  - "license and source policy report"
+
+phase_7_fault_matrix[13]:
+  - process_kill
+  - disk_full
+  - permission_loss
+  - metadata_corruption
+  - missing_chunk
+  - network_timeout
+  - snapshot_cleanup_failure
+  - daemon_restart
+  - queue_saturation
+  - limiter_error
+  - stale_plan
+  - concurrent_reader
+  - interrupted_gc
+
+quality_gates:
+  local_commands[6]:
+    - "cargo fmt --all -- --check"
+    - "cargo clippy --all-targets --all-features -- -D warnings"
+    - "cargo test --lib --bins --tests --all-features --offline -- --test-threads=1"
+    - "cargo build --release --offline"
+    - "cargo audit"
+    - "license and source policy check"
+  ci_requirements[7]:
+    - "all required GitHub Actions success"
+    - "CLI lifecycle smoke success"
+    - "snapshot provider contract success"
+    - "release archive install smoke success"
+    - "RustSec advisory gate success"
+    - "secret scanning success"
+    - "verified critical/important finding 0"
+  data_integrity[6]:
+    - "모든 restore 결과 byte-identical"
+    - "공유 청크 생존자 restore 성공"
+    - "repair가 누락 데이터를 생성하지 않음"
+    - "GC가 live 또는 post-crash reused CID를 삭제하지 않음"
+    - "restart 후 journal recovery idempotent"
+    - "24시간 soak 중 데이터 손실 0"
+  platform_labels[3]:
+    - contract-tested
+    - integration-tested
+    - hardware-verified
+
+completion:
+  product_complete_when[10]:
+    - "evidence score >= 85"
+    - "Phase 0-7 코드 범위 완료"
+    - "모든 로컬·CI 품질 게이트 성공"
+    - "verified critical/important finding 0"
+    - "24시간 soak 성공"
+    - "최소 하나의 실제 snapshot provider integration test 성공"
+    - "지원 수준이 모든 플랫폼에 명시됨"
+    - "main에 최종 코드와 문서 병합"
+    - "semver release와 설치 아카이브 게시"
+    - "operator runbook과 recovery 절차 검증"
+  all_platforms_complete_when[5]:
+    - "LVM hardware-verified"
+    - "ZFS hardware-verified"
+    - "Proxmox hardware-verified"
+    - "everRun hardware-verified"
+    - "ztC hardware-verified"
+  terminal_states[2]:
+    completed: "제품 완성 게이트와 가능한 모든 실장비 게이트가 통과됨"
+    externally_blocked: "코드·계약·가상 통합 작업은 모두 완료됐지만 필요한 랩·자격증명·권한이 없어 실장비 검증만 불가능함"
+  forbidden_completion_claims[4]:
+    - "CI 일부만 성공한 상태"
+    - "contract test를 실장비 검증으로 표현"
+    - "known data-loss finding 존재"
+    - "release artifact 설치 검증 미완료"
+
+final_instruction: "중간 진행을 사용자에게 보고하지 말고, 독립 작업을 계속한다. 완료 또는 외부 블로커로 더 이상 진행할 수 없는 시점에만 단일 최종 보고를 제출한다."

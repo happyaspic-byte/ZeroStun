@@ -1,16 +1,17 @@
 # Repository format
 
-Format version: `1`
+Format version: `2`
 
 ## Layout
 
 ```text
 <repo>/
-  VERSION                 # ASCII integer, currently "1\n"
-  index.redb              # completed backup index
+  VERSION                 # ASCII integer, currently "2\n"
+  index.redb              # completed backup and tombstone index
   .lock                   # exclusive OS flock (survives crash without manual cleanup)
   chunks/<aa>/<rest>      # immutable compressed chunk files
   manifests/<id>.manifest # published manifests
+  trash/<gc-id>/<aa>/<rest> # same-filesystem GC staging
   tmp/                    # temporary files, never listed as backups
 ```
 
@@ -19,7 +20,7 @@ remaining 62 hex characters.
 
 ## Magic and versions
 
-- Repository `VERSION` file: `REPO_FORMAT_VERSION = 1`
+- Repository `VERSION` file: `REPO_FORMAT_VERSION = 2`
 - Manifest bytes: 8-byte magic `ZSTNMFST` + little-endian `u32` format version + JSON body
 - Unknown major versions are rejected
 
@@ -89,12 +90,60 @@ payload length are recorded in that backup's manifest.
 8. `rename` into `manifests/<id>.manifest` as a human-readable copy.
 
 `list`, `inspect`, `verify`, and `restore` load completed backups from
-`index.redb` only. A crash after the file rename but before the database
-commit cannot expose an unfinished backup. A crash after the database
-commit but before the file rename still leaves the backup visible, because
-the authoritative copy is in redb.
+`index.redb` only and hide any backup ID present in the `tombstones` table.
+Tombstoning never modifies completed backup bytes or chunk files. A crash after
+the file rename but before the database commit cannot expose an unfinished
+backup. A crash after the database commit but before the file rename still
+leaves the backup visible, because the authoritative copy is in redb.
+
+## Garbage collection journal
+
+Garbage collection is tombstone-based and split into deterministic plan/apply operations.
+`plan_gc` marks chunks from one redb snapshot of `backups` and `tombstones`; malformed
+manifests, missing live chunks, or unexpected chunk inventory names fail closed. Plans use
+repository-relative canonical `chunks/<aa>/<rest>` and `trash/<gc-id>/<aa>/<rest>` paths.
+`apply_gc` rechecks active reader leases and every planned path, content ID, byte count, exact
+tombstone generation set, and current live-set before mutation. Both `apply_gc` and destructive
+`recover_gc` are caller-held writer-lock primitives; neither acquires a nested writer lock.
+
+The `gc_journals` redb table stores bounded JSON `GcJournal` DTOs. Each new journal persists
+its full plan once before `Moving`; filesystem source/trash state is authoritative during
+recovery, so new journals keep `moved` empty. Recovery still decodes legacy cumulative `moved`
+lists up to 1,000,000 entries and legacy plans without tombstone snapshots. Journal state is
+synced before filesystem moves and at the committed transition, avoiding repeated full-plan
+rewrites. The typed `gc_state` table holds a GC barrier. Barrier installation and the empty-lease
+check share one redb write transaction; reader visibility checks and lease insertion likewise
+share one write transaction. The barrier remains installed through destructive work and is
+removed atomically with the terminal journal. After same-filesystem rename, the destination
+directory is synced before the source directory.
+
+Phases have these crash semantics:
+
+- `Planned`: no committed deletion point; recovery restores any chunk found in trash.
+- `Moving`: recovery rolls every moved or rename-before-journal-update chunk back to `chunks/`.
+- `Committed`: deletion is irrevocable; recovery rolls forward from source or trash.
+- `Deleting`: recovery continues trash deletion, tombstone/index finalization, and manifest-copy removal.
+- `Complete`: terminal journal entries are removed; later recovery has no historical work to repeat.
+
+Recovery reconstructs the current live set before any `Committed`/`Deleting` mutation and
+refuses to delete a CID that became live after the crash. It removes rolled-back and completed
+journals durably. It never overwrites an existing source or trash destination. Dual copies are
+corruption. GC validates repository roots and all `chunks`, prefix, `manifests`, and `trash`
+ancestors as confined real directories, then boundedly parses, decompresses, and rehashes every
+live, reclaim, and recovery source chunk. Live chunk codec and lengths must match manifest
+metadata.
+
+Directory durability is a Unix contract: directory `sync_all` is exercised on Unix. The
+non-Unix implementation is intentionally a no-op because portable directory fsync is not
+available through the Rust standard library.
+After `Committed`, authoritative `backups` and `tombstones` entries are removed consistently and
+the human-readable manifest copy is deleted, preventing undelete of a finalized backup. Chunks
+still referenced by any valid non-tombstoned manifest remain live.
 
 ## Compatibility
 
 Readers must reject an unknown `VERSION` or unknown manifest magic/version.
-Existing v1 repositories are opened idempotently by `init`.
+Version 1 readers do not understand tombstones, so version 2 repositories are
+not readable by them. `Repository::open` rejects version 1 without mutation.
+`Repository::init` explicitly migrates version 1 by creating the tombstone table
+and only then atomically replacing `VERSION` with `2\n`.

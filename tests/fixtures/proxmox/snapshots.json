@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "name": "current",
+      "description": "You are here!",
+      "snaptime": 0
+    },
+    {
+      "name": "zerostun-old2",
+      "description": "zerostun",
+      "snaptime": 2
+    },
+    {
+      "name": "zerostun-old1",
+      "description": "zerostun",
+      "snaptime": 1
+    }
+  ]
+}

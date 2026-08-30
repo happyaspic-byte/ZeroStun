@@ -98,6 +98,7 @@ pub async fn backup(
     }
 
     let _lock = repo.acquire_writer_lock()?;
+    repo.refuse_when_gc_in_progress()?;
     let chunk_params = config.validate()?;
 
     let source = FileSource::open(&source_canon)?;
@@ -253,7 +254,7 @@ pub async fn backup(
     source.verify_unchanged()?;
 
     manifest.root_hash = root_hash_from_manifest(&manifest);
-    repo.commit_manifest(&manifest)?;
+    repo.commit_manifest_locked(&manifest)?;
 
     let total_chunks = unique_chunks + reused_chunks;
     let dedupe_ratio = if stored_bytes > 0 {
@@ -274,9 +275,45 @@ pub async fn backup(
     })
 }
 
+#[cfg(test)]
+type LeasePause = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+
+#[cfg(test)]
+static PAUSE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+static OPERATION_LEASE_PAUSE: std::sync::Mutex<Option<LeasePause>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_operation_lease_pause(entered: Arc<std::sync::Barrier>, release: Arc<std::sync::Barrier>) {
+    *OPERATION_LEASE_PAUSE.lock().expect("operation lease pause") = Some((entered, release));
+}
+
+#[cfg(test)]
+fn pause_after_lease_acquisition() {
+    let pause = OPERATION_LEASE_PAUSE
+        .lock()
+        .expect("operation lease pause")
+        .take();
+    if let Some((entered, release)) = pause {
+        entered.wait();
+        release.wait();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_after_lease_acquisition() {}
+
 pub async fn verify(repo: &Repository, backup_id: &str) -> Result<VerifyReport> {
-    let manifest = match repo.load_manifest(backup_id) {
-        Ok(m) => m,
+    let (manifest, _lease) = match repo.resolve_manifest_with_reader_lease(backup_id) {
+        Ok(resolved) => resolved,
+        Err(
+            error @ (Error::BackupNotFound(_)
+            | Error::BackupDeleted(_)
+            | Error::GarbageCollection(_)
+            | Error::ActiveReader(_)
+            | Error::RepositoryLocked(_)),
+        ) => return Err(error),
         Err(e) => {
             return Ok(VerifyReport {
                 backup_id: backup_id.to_string(),
@@ -288,8 +325,14 @@ pub async fn verify(repo: &Repository, backup_id: &str) -> Result<VerifyReport> 
             });
         }
     };
+    pause_after_lease_acquisition();
+    verify_manifest(repo, &manifest)
+}
 
-    let expected_root = root_hash_from_manifest(&manifest);
+fn verify_manifest(repo: &Repository, manifest: &Manifest) -> Result<VerifyReport> {
+    let backup_id = manifest.backup_id.as_str();
+
+    let expected_root = root_hash_from_manifest(manifest);
     if manifest.root_hash != expected_root {
         return Ok(VerifyReport {
             backup_id: backup_id.to_string(),
@@ -434,14 +477,15 @@ pub async fn restore(
     target_path: &Path,
     force: bool,
 ) -> Result<()> {
-    let report = verify(repo, backup_id).await?;
+    let (manifest, _lease) = repo.resolve_manifest_with_reader_lease(backup_id)?;
+    pause_after_lease_acquisition();
+    let report = verify_manifest(repo, &manifest)?;
     if !report.is_ok() {
         return Err(Error::RootHashMismatch {
             backup_id: backup_id.to_string(),
         });
     }
 
-    let manifest = repo.load_manifest(backup_id)?;
     let expected_root = root_hash_from_manifest(&manifest);
     if manifest.root_hash != expected_root {
         return Err(Error::RootHashMismatch {
@@ -572,4 +616,67 @@ fn getrandom_hex(len: usize) -> String {
     let mut buf = vec![0u8; len];
     let _ = getrandom::fill(&mut buf);
     hex::encode(buf)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::{Arc, Barrier};
+
+    use crate::hash::root_hash_from_manifest;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn verify_exposes_one_lease_while_blocked_then_cleans_up() {
+        let _guard = PAUSE_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(Repository::init(&temp.path().join("repo")).unwrap());
+        let mut manifest = Manifest::new("backup-paused-verify", 0, 64, 128, 256);
+        manifest.root_hash = root_hash_from_manifest(&manifest);
+        repo.commit_manifest(&manifest).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        set_operation_lease_pause(Arc::clone(&entered), Arc::clone(&release));
+
+        let task_repo = Arc::clone(&repo);
+        let task = tokio::spawn(async move { verify(&task_repo, "backup-paused-verify").await });
+        entered.wait();
+        let leases = repo.active_reader_leases().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].backup_id, "backup-paused-verify");
+        release.wait();
+
+        assert!(task.await.unwrap().unwrap().is_ok());
+        assert!(repo.active_reader_leases().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restore_failure_keeps_one_lease_until_return_then_cleans_up() {
+        let _guard = PAUSE_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Arc::new(Repository::init(&temp.path().join("repo")).unwrap());
+        let manifest = Manifest::new("backup-paused-restore", 0, 64, 128, 256);
+        repo.commit_manifest(&manifest).unwrap();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        set_operation_lease_pause(Arc::clone(&entered), Arc::clone(&release));
+        let target = temp.path().join("restore.bin");
+
+        let task_repo = Arc::clone(&repo);
+        let task = tokio::spawn(async move {
+            restore(&task_repo, "backup-paused-restore", &target, false).await
+        });
+        entered.wait();
+        let leases = repo.active_reader_leases().unwrap();
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].backup_id, "backup-paused-restore");
+        release.wait();
+
+        assert!(matches!(
+            task.await.unwrap(),
+            Err(Error::RootHashMismatch { ref backup_id }) if backup_id == "backup-paused-restore"
+        ));
+        assert!(repo.active_reader_leases().unwrap().is_empty());
+    }
 }

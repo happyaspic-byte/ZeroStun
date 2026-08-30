@@ -1,0 +1,10 @@
+{
+  "data": [
+    {
+      "storage": "local-lvm",
+      "type": "lvmthin",
+      "content": "images,rootdir",
+      "active": 1
+    }
+  ]
+}

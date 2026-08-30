@@ -6,7 +6,7 @@ ZeroStun is a single CLI binary with library modules that have one responsibilit
 
 | Module | Responsibility |
 | --- | --- |
-| `cli` (`src/main.rs`) | clap parsing, human/JSON output, exit codes |
+| `cli` (`src/main.rs`) | clap parsing, human/JSON output, hidden generate-assets, exit codes |
 | `config` | byte-size parsing, worker/queue validation, in-flight payload bound |
 | `engine` | backup / verify / restore / inspect lifecycle |
 | `source` | regular-file sequential input and start/end fingerprint |
@@ -17,6 +17,9 @@ ZeroStun is a single CLI binary with library modules that have one responsibilit
 | `manifest` | versioned encoding of backup metadata |
 | `rate_limit` | deficit token bucket for bytes/sec and optional IOPS |
 | `telemetry` | progress mode and job stats |
+| `snapshot` | object-safe snapshot providers, exact-argv command runner, typed HTTP transport, LVM, ZFS, Proxmox, and Stratus adapters |
+| `daemon` | TOML job admission, injected-clock scheduler, retry classification, SIGTERM shutdown, redb job/run state |
+| `packaging` | pinned toolchain, cargo-deny policy, clap-generated completions/man, unpublished GNU/musl archives, CycloneDX SBOM |
 
 ## Backup pipeline
 

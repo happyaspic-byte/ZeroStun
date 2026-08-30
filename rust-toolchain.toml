@@ -1,0 +1,6 @@
+[toolchain]
+# Release/build pin. Cargo.toml declares MSRV 1.90, the true minimum of the
+# locked graph (redb 4.2.0). CI tests this 1.97.1 pin.
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

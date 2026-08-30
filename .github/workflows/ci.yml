@@ -5,6 +5,9 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -13,18 +16,27 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
         with:
           components: rustfmt, clippy
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --lib --bin zerostun -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - name: Test
-        run: cargo test --lib --bins --tests -- --test-threads=1
+        run: cargo test --lib --bins --tests --locked -- --test-threads=1
+      - name: Supply chain
+        run: |
+          cargo install cargo-deny --locked --version 0.20.2
+          command -v cargo-deny
+          cargo fetch --locked
+          cargo deny fetch db
+          cargo deny --offline --locked check licenses sources bans advisories
       - name: Release build
-        run: cargo build --release
+        run: cargo build --release --locked
       - name: CLI smoke
         run: |
           set -euo pipefail
@@ -36,6 +48,8 @@ jobs:
           with p.open("wb") as f:
               for i in range(50_000):
                   f.write((i & 0xffffffff).to_bytes(4, "little"))
+          Path("${tmp}/shared.bin").write_bytes(bytes(range(256)) * 400)
+          Path("${tmp}/unique.bin").write_bytes(bytes(range(256)) * 200 + b"unique-tail")
           PY
           "$bin" init --repo "${tmp}/repo"
           "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/source.bin" --codec none > "${tmp}/backup.json"
@@ -43,12 +57,30 @@ jobs:
           "$bin" verify --repo "${tmp}/repo" --backup-id "$id"
           "$bin" restore --repo "${tmp}/repo" --backup-id "$id" --target "${tmp}/restored.bin"
           cmp "${tmp}/source.bin" "${tmp}/restored.bin"
+          "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/shared.bin" --codec none > "${tmp}/first.json"
+          "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/unique.bin" --codec none > "${tmp}/second.json"
+          first=$(python3 -c "import json; print(json.load(open('${tmp}/first.json'))['backup_id'])")
+          second=$(python3 -c "import json; print(json.load(open('${tmp}/second.json'))['backup_id'])")
+          "$bin" --json delete --repo "${tmp}/repo" --backup-id "$first"
+          "$bin" --json gc --repo "${tmp}/repo"
+          "$bin" delete --repo "${tmp}/repo" --backup-id "$first" --apply
+          "$bin" restore --repo "${tmp}/repo" --backup-id "$second" --target "${tmp}/survivor.bin"
+          cmp "${tmp}/unique.bin" "${tmp}/survivor.bin"
+          "$bin" gc --repo "${tmp}/repo" --apply
+          "$bin" repair --repo "${tmp}/repo"
+          "$bin" verify --repo "${tmp}/repo" --backup-id "$second"
+          "$bin" restore --repo "${tmp}/repo" --backup-id "$second" --target "${tmp}/survivor2.bin"
+          cmp "${tmp}/unique.bin" "${tmp}/survivor2.bin"
 
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
