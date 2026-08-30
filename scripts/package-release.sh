@@ -55,21 +55,17 @@ fi
 [[ -f $binary && -x $binary ]] || { echo "binary is not an executable regular file: $binary" >&2; exit 2; }
 
 scratch=${TMPDIR:-/tmp}
-metadata=$(mktemp -p "$scratch")
 stage=$(mktemp -d -p "$scratch")
 cleanup() {
-  rm -f "$metadata"
   rm -rf "$stage"
 }
 trap cleanup EXIT
 
-cargo metadata --manifest-path "$repo_root/Cargo.toml" --format-version 1 --locked --offline > "$metadata"
-version=$(python3 - "$metadata" <<'PY'
-import json, sys
-metadata = json.load(open(sys.argv[1], encoding="utf-8"))
-root = metadata["resolve"]["root"]
-package = next(pkg for pkg in metadata["packages"] if pkg["id"] == root)
-print(package["version"])
+version=$(python3 - "$repo_root/Cargo.toml" <<'PY'
+import sys, tomllib
+with open(sys.argv[1], "rb") as handle:
+    manifest = tomllib.load(handle)
+print(manifest["package"]["version"])
 PY
 )
 package="zerostun-${version}-${target}"
@@ -98,36 +94,63 @@ install -m 0644 "$repo_root/packaging/daemon.toml" "$root/etc/zerostun/daemon.to
 install -m 0644 "$repo_root/LICENSE-APACHE" "$root/share/doc/zerostun/LICENSE-APACHE"
 install -m 0644 "$repo_root/LICENSE-MIT" "$root/share/doc/zerostun/LICENSE-MIT"
 
-python3 - "$metadata" "$root/share/doc/zerostun/sbom.cdx.json" <<'PY'
-import json, sys
-metadata = json.load(open(sys.argv[1], encoding="utf-8"))
-root_id = metadata["resolve"]["root"]
-root = next(pkg for pkg in metadata["packages"] if pkg["id"] == root_id)
+python3 - "$repo_root/Cargo.toml" "$repo_root/Cargo.lock" "$root/share/doc/zerostun/sbom.cdx.json" <<'PY'
+import json, sys, tomllib
 
-def component(pkg, kind="library"):
+with open(sys.argv[1], "rb") as handle:
+    manifest = tomllib.load(handle)
+root_name = manifest["package"]["name"]
+root_version = manifest["package"]["version"]
+root_license = manifest["package"].get("license")
+
+packages = []
+current = None
+with open(sys.argv[2], encoding="utf-8") as handle:
+    for raw in handle:
+        line = raw.rstrip("\n")
+        if line == "[[package]]":
+            if current:
+                packages.append(current)
+            current = {}
+            continue
+        if current is None:
+            continue
+        if line.startswith("name = "):
+            current["name"] = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("version = "):
+            current["version"] = line.split("=", 1)[1].strip().strip('"')
+        elif line == "":
+            packages.append(current)
+            current = None
+    if current:
+        packages.append(current)
+
+def component(name, version, kind="library", license=None):
     item = {
         "type": kind,
-        "bom-ref": pkg["id"],
-        "name": pkg["name"],
-        "version": pkg["version"],
-        "purl": f"pkg:cargo/{pkg['name']}@{pkg['version']}",
+        "bom-ref": f"pkg:cargo/{name}@{version}",
+        "name": name,
+        "version": version,
+        "purl": f"pkg:cargo/{name}@{version}",
     }
-    if pkg.get("license"):
-        item["licenses"] = [{"expression": pkg["license"]}]
+    if license:
+        item["licenses"] = [{"expression": license}]
     return item
 
 bom = {
     "bomFormat": "CycloneDX",
     "specVersion": "1.5",
     "version": 1,
-    "metadata": {"component": component(root, "application")},
+    "metadata": {
+        "component": component(root_name, root_version, "application", root_license)
+    },
     "components": [
-        component(pkg)
-        for pkg in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"]))
-        if pkg["id"] != root_id
+        component(pkg["name"], pkg["version"])
+        for pkg in sorted(packages, key=lambda item: (item["name"], item["version"]))
+        if not (pkg["name"] == root_name and pkg["version"] == root_version)
     ],
 }
-with open(sys.argv[2], "w", encoding="utf-8") as handle:
+with open(sys.argv[3], "w", encoding="utf-8") as handle:
     json.dump(bom, handle, indent=2, sort_keys=True)
     handle.write("\n")
 PY

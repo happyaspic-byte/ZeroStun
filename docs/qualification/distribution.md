@@ -29,7 +29,7 @@ SHA-256 checksum without publishing or creating a tag. The archive contains:
 - a generated `zerostun(1)` man page
 - `zerostun-daemon.service` and `daemon.toml.example`
 - Apache-2.0 and MIT license texts
-- a CycloneDX 1.5 JSON SBOM generated from locked Cargo metadata
+- a CycloneDX 1.5 JSON SBOM generated directly from `Cargo.toml` and `Cargo.lock` without fetching unused-platform crates
 
 Required local tools are Cargo/Rust, Bash, Python 3, GNU tar, gzip, `install`,
 and `sha256sum`. A musl build additionally needs the Rust musl target and
