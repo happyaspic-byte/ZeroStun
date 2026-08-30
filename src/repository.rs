@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fs4::FileExt;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -45,8 +45,8 @@ pub const REPO_TRASH_DIR: &str = "trash";
 pub const REPO_LOCK_FILE: &str = ".lock";
 pub const REPO_DB_FILE: &str = "index.redb";
 
-const TABLE_BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
-const TABLE_CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
+pub(crate) const TABLE_BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+pub(crate) const TABLE_CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
 
 #[derive(Debug)]
 pub struct RepositoryLock {
@@ -61,7 +61,7 @@ impl Drop for RepositoryLock {
 
 pub struct Repository {
     root: PathBuf,
-    db: Arc<Database>,
+    db: Mutex<Option<Arc<Database>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +143,7 @@ impl Repository {
         validate_repository_directories(&root)?;
         Ok(Self {
             root,
-            db: Arc::new(db),
+            db: Mutex::new(Some(Arc::new(db))),
         })
     }
 
@@ -176,8 +176,37 @@ impl Repository {
         let db = Database::open(db_path)?;
         Ok(Self {
             root,
-            db: Arc::new(db),
+            db: Mutex::new(Some(Arc::new(db))),
         })
+    }
+
+    pub(crate) fn database(&self) -> Result<Arc<Database>> {
+        let guard = match self.db.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| Error::Database("repository database is closed".to_string()))
+    }
+
+    pub(crate) fn take_database(&self) -> Result<Arc<Database>> {
+        let mut guard = match self.db.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard
+            .take()
+            .ok_or_else(|| Error::Database("repository database is closed".to_string()))
+    }
+
+    pub(crate) fn install_database(&self, db: Database) {
+        let handle = Some(Arc::new(db));
+        match self.db.lock() {
+            Ok(mut guard) => *guard = handle,
+            Err(poisoned) => *poisoned.into_inner() = handle,
+        }
     }
 
     pub fn acquire_writer_lock(&self) -> Result<RepositoryLock> {
@@ -287,6 +316,7 @@ impl Repository {
             .join(REPO_TMP_DIR)
             .join(format!("manifest-{}-{rnd}", manifest.backup_id));
 
+        let db = self.database()?;
         let result = (|| -> Result<()> {
             let mut f = File::create(&tmp_path)?;
             f.write_all(&encoded)?;
@@ -294,7 +324,7 @@ impl Repository {
             f.sync_all()?;
             drop(f);
 
-            let write_txn = self.db.begin_write()?;
+            let write_txn = db.begin_write()?;
             {
                 let tombstones = write_txn.open_table(TOMBSTONES)?;
                 if tombstones.get(manifest.backup_id.as_str())?.is_some() {
@@ -325,7 +355,8 @@ impl Repository {
     }
 
     fn ensure_backup_id_available(&self, backup_id: &str) -> Result<()> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let tombstones = read_txn.open_table(TOMBSTONES)?;
         if tombstones.get(backup_id)?.is_some() {
             return Err(Error::BackupDeleted(backup_id.to_string()));
@@ -339,7 +370,8 @@ impl Repository {
 
     pub fn plan_delete(&self, backup_id: &str) -> Result<DeletePlan> {
         validate_backup_id(backup_id)?;
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         if backups.get(backup_id)?.is_none() {
             return Err(Error::BackupNotFound(backup_id.to_string()));
@@ -354,7 +386,8 @@ impl Repository {
     /// Applies a delete plan. The caller must hold the repository writer lock.
     pub fn apply_delete(&self, plan: &DeletePlan) -> Result<DeleteResult> {
         validate_backup_id(&plan.backup_id)?;
-        let write_txn = self.db.begin_write()?;
+        let db = self.database()?;
+        let write_txn = db.begin_write()?;
         let tombstoned = {
             let backups = write_txn.open_table(TABLE_BACKUPS)?;
             if backups.get(plan.backup_id.as_str())?.is_none() {
@@ -379,7 +412,8 @@ impl Repository {
 
     pub fn plan_undelete(&self, backup_id: &str) -> Result<UndeletePlan> {
         validate_backup_id(backup_id)?;
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         if backups.get(backup_id)?.is_none() {
             return Err(Error::BackupNotFound(backup_id.to_string()));
@@ -394,7 +428,8 @@ impl Repository {
     /// Applies an undelete plan. The caller must hold the repository writer lock.
     pub fn apply_undelete(&self, plan: &UndeletePlan) -> Result<UndeleteResult> {
         validate_backup_id(&plan.backup_id)?;
-        let write_txn = self.db.begin_write()?;
+        let db = self.database()?;
+        let write_txn = db.begin_write()?;
         let restored = {
             let backups = write_txn.open_table(TABLE_BACKUPS)?;
             if backups.get(plan.backup_id.as_str())?.is_none() {
@@ -414,7 +449,8 @@ impl Repository {
 
     pub fn is_tombstoned(&self, backup_id: &str) -> Result<bool> {
         validate_backup_id(backup_id)?;
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let tombstones = read_txn.open_table(TOMBSTONES)?;
         Ok(tombstones.get(backup_id)?.is_some())
     }
@@ -429,7 +465,8 @@ impl Repository {
         backup_id: &str,
     ) -> Result<(Manifest, ReaderLeaseGuard)> {
         validate_backup_id(backup_id)?;
-        let write_txn = self.db.begin_write()?;
+        let db = self.database()?;
+        let write_txn = db.begin_write()?;
         let manifest = {
             let backups = write_txn.open_table(TABLE_BACKUPS)?;
             let bytes = backups
@@ -454,14 +491,12 @@ impl Repository {
         }
         let (_, lease_id) = insert_reader_lease(&write_txn, backup_id)?;
         write_txn.commit()?;
-        Ok((
-            manifest,
-            ReaderLeaseGuard::new(Arc::clone(&self.db), lease_id),
-        ))
+        Ok((manifest, ReaderLeaseGuard::new(db, lease_id)))
     }
 
     pub fn active_reader_leases(&self) -> Result<Vec<ReaderLease>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         read_active_reader_leases(&read_txn)
     }
 
@@ -469,7 +504,8 @@ impl Repository {
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
             let gc_id = format!("gc-{}-{}", unix_ms(), getrandom_hex_result(8)?);
-            let read_txn = self.db.begin_read()?;
+            let db = self.database()?;
+            let read_txn = db.begin_read()?;
             let journals = read_txn.open_table(GC_JOURNALS)?;
             let journal_exists = journals.get(gc_id.as_str())?.is_some();
             drop(journals);
@@ -486,7 +522,8 @@ impl Repository {
     }
 
     pub fn plan_gc(&self) -> Result<GcPlan> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         if !read_active_reader_leases(&read_txn)?.is_empty() {
             return Err(Error::GarbageCollection(
                 "garbage collection refused while active reader leases exist".to_string(),
@@ -637,14 +674,15 @@ impl Repository {
         }
         let current = self.plan_gc()?;
         validate_gc_plan(plan, &current, &self.root)?;
-        ensure_gc_namespace_available(&self.db, &self.root, &plan.gc_id)?;
+        let db = self.database()?;
+        ensure_gc_namespace_available(&db, &self.root, &plan.gc_id)?;
         ensure_confined_real_directory(&self.root, &self.root.join(REPO_MANIFESTS_DIR))?;
         let journal = GcJournal {
             plan: plan.clone(),
             phase: GcPhase::Moving,
             moved: Vec::new(),
         };
-        install_gc_barrier_and_journal(&self.db, &self.root, &journal)?;
+        install_gc_barrier_and_journal(&db, &self.root, &journal)?;
         for (index, item) in plan.reclaim_chunks.iter().enumerate() {
             let source = self.root.join(&item.source);
             let trash = self.root.join(&item.trash);
@@ -663,7 +701,7 @@ impl Repository {
         }
         let mut journal = journal;
         journal.phase = GcPhase::Committed;
-        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
+        persist_gc_journal_durable(&db, &self.root, &journal)?;
         if fault == Some(GcFaultPoint::AfterCommitted) {
             return Err(Error::GarbageCollection(
                 "injected GC fault after committed marker".to_string(),
@@ -672,7 +710,7 @@ impl Repository {
         delete_gc_trash(&self.root, plan)?;
         self.finalize_gc_tombstones(&plan.tombstones)?;
         remove_gc_trash_directories(&self.root, plan)?;
-        remove_gc_journal_and_barrier(&self.db, &self.root, &plan.gc_id)?;
+        remove_gc_journal_and_barrier(&db, &self.root, &plan.gc_id)?;
         Ok(GcResult {
             gc_id: plan.gc_id.clone(),
             reclaimed_chunks: plan.reclaim_chunks.len() as u64,
@@ -689,7 +727,8 @@ impl Repository {
     ///
     /// This low-level primitive intentionally does not acquire a nested OS writer lock.
     pub fn recover_gc(&self) -> Result<Vec<GcRecoveryResult>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let table = read_txn.open_table(GC_JOURNALS)?;
         let mut journals = Vec::new();
         for item in table.iter()? {
@@ -705,23 +744,23 @@ impl Repository {
             validate_gc_journal_plan(&journal.plan, &self.root)?;
             match journal.phase {
                 GcPhase::Planned | GcPhase::Moving => {
-                    ensure_gc_barrier(&self.db)?;
+                    ensure_gc_barrier(&db)?;
                     rollback_gc_moves(&self.root, &journal.plan)?;
                     remove_gc_trash_directories(&self.root, &journal.plan)?;
-                    remove_gc_journal_and_barrier(&self.db, &self.root, &journal.plan.gc_id)?;
+                    remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
                 }
                 GcPhase::Committed | GcPhase::Deleting => {
-                    ensure_gc_barrier(&self.db)?;
-                    validate_recovery_live_set(&self.db, &journal.plan)?;
+                    ensure_gc_barrier(&db)?;
+                    validate_recovery_live_set(&db, &journal.plan)?;
                     journal.phase = GcPhase::Deleting;
                     delete_gc_trash(&self.root, &journal.plan)?;
                     self.finalize_gc_tombstones(&journal.plan.tombstones)?;
                     remove_gc_trash_directories(&self.root, &journal.plan)?;
-                    remove_gc_journal_and_barrier(&self.db, &self.root, &journal.plan.gc_id)?;
+                    remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
                 }
                 GcPhase::Complete => {
                     remove_gc_trash_directories(&self.root, &journal.plan)?;
-                    remove_gc_journal_and_barrier(&self.db, &self.root, &journal.plan.gc_id)?;
+                    remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
                 }
             }
             results.push(GcRecoveryResult {
@@ -737,7 +776,8 @@ impl Repository {
 
     fn finalize_gc_tombstones(&self, planned: &[GcTombstone]) -> Result<()> {
         ensure_confined_real_directory(&self.root, &self.root.join(REPO_MANIFESTS_DIR))?;
-        match tombstone_set_status(&self.db, planned)? {
+        let db = self.database()?;
+        match tombstone_set_status(&db, planned)? {
             TombstoneSetStatus::Pending => {}
             TombstoneSetStatus::Finalized => return Ok(()),
         }
@@ -763,7 +803,7 @@ impl Repository {
         }
         sync_directory(&self.root.join(REPO_MANIFESTS_DIR))?;
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = db.begin_write()?;
         {
             let mut tombstones = write_txn.open_table(TOMBSTONES)?;
             let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
@@ -786,7 +826,8 @@ impl Repository {
     }
 
     pub fn remove_stale_reader_leases(&self) -> Result<Vec<String>> {
-        let write_txn = self.db.begin_write()?;
+        let db = self.database()?;
+        let write_txn = db.begin_write()?;
         let removed = {
             let mut table = write_txn.open_table(READER_LEASES)?;
             let mut stale_ids = Vec::new();
@@ -809,7 +850,8 @@ impl Repository {
 
     pub fn load_manifest(&self, backup_id: &str) -> Result<Manifest> {
         validate_backup_id(backup_id)?;
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         let bytes = backups
             .get(backup_id)?
@@ -831,7 +873,8 @@ impl Repository {
     }
 
     pub fn list_backup_summaries(&self) -> Result<Vec<BackupSummaryItem>> {
-        let read_txn = self.db.begin_read()?;
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         let tombstones = read_txn.open_table(TOMBSTONES)?;
         let mut items = Vec::new();
@@ -1296,7 +1339,7 @@ fn validate_gc_journal_plan(plan: &GcPlan, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_chunk_file(
+pub(crate) fn validate_chunk_file(
     path: &Path,
     content_id: &ContentId,
     descriptor: Option<&ChunkDescriptor>,

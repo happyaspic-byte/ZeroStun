@@ -19,8 +19,9 @@ pub use config::BackupConfig;
 pub use engine::{backup, inspect, restore, verify, BackupSummary, InspectReport, VerifyReport};
 pub use error::{Error, ExitCode};
 pub use lifecycle::{
-    ChunkMove, DeletePlan, DeleteResult, GcJournal, GcPhase, GcPlan, GcRecoveryResult, GcResult,
-    GcTombstone, UndeletePlan, UndeleteResult,
+    ChunkMove, DeletePlan, DeleteResult, FindingKind, FindingSeverity, GcJournal, GcPhase, GcPlan,
+    GcRecoveryResult, GcResult, GcTombstone, RepairFinding, RepairPlan, RepairReport, RepairResult,
+    RepairScope, UndeletePlan, UndeleteResult, DEFAULT_MAX_REPAIR_FINDINGS,
 };
 pub use lifecycle::{ReaderLease, ReaderLeaseGuard};
 pub use repository::{BackupSummaryItem, Repository};
