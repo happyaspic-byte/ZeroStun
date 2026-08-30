@@ -20,7 +20,7 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --lib --bin zerostun -- -D warnings
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --lib --bins --tests -- --test-threads=1
       - name: Release build
@@ -36,6 +36,8 @@ jobs:
           with p.open("wb") as f:
               for i in range(50_000):
                   f.write((i & 0xffffffff).to_bytes(4, "little"))
+          Path("${tmp}/shared.bin").write_bytes(bytes(range(256)) * 400)
+          Path("${tmp}/unique.bin").write_bytes(bytes(range(256)) * 200 + b"unique-tail")
           PY
           "$bin" init --repo "${tmp}/repo"
           "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/source.bin" --codec none > "${tmp}/backup.json"
@@ -43,6 +45,20 @@ jobs:
           "$bin" verify --repo "${tmp}/repo" --backup-id "$id"
           "$bin" restore --repo "${tmp}/repo" --backup-id "$id" --target "${tmp}/restored.bin"
           cmp "${tmp}/source.bin" "${tmp}/restored.bin"
+          "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/shared.bin" --codec none > "${tmp}/first.json"
+          "$bin" --json backup --repo "${tmp}/repo" --source "${tmp}/unique.bin" --codec none > "${tmp}/second.json"
+          first=$(python3 -c "import json; print(json.load(open('${tmp}/first.json'))['backup_id'])")
+          second=$(python3 -c "import json; print(json.load(open('${tmp}/second.json'))['backup_id'])")
+          "$bin" --json delete --repo "${tmp}/repo" --backup-id "$first"
+          "$bin" --json gc --repo "${tmp}/repo"
+          "$bin" delete --repo "${tmp}/repo" --backup-id "$first" --apply
+          "$bin" restore --repo "${tmp}/repo" --backup-id "$second" --target "${tmp}/survivor.bin"
+          cmp "${tmp}/unique.bin" "${tmp}/survivor.bin"
+          "$bin" gc --repo "${tmp}/repo" --apply
+          "$bin" repair --repo "${tmp}/repo"
+          "$bin" verify --repo "${tmp}/repo" --backup-id "$second"
+          "$bin" restore --repo "${tmp}/repo" --backup-id "$second" --target "${tmp}/survivor2.bin"
+          cmp "${tmp}/unique.bin" "${tmp}/survivor2.bin"
 
   audit:
     runs-on: ubuntu-latest
