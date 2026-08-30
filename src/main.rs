@@ -470,6 +470,14 @@ async fn run(cli: Cli) -> zerostun::error::Result<ExitCode> {
 }
 
 fn generate_assets(output_dir: &Path) -> Result<(), Error> {
+    if output_dir
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(Error::InvalidConfig(
+            "generate-assets output directory must not contain ..".to_string(),
+        ));
+    }
     fs::create_dir_all(output_dir)?;
     let mut command = Cli::command();
     let name = command.get_name().to_string();

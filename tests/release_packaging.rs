@@ -140,7 +140,6 @@ fn supply_chain_policy_is_explicit_and_release_never_creates_tags() {
     for license in [
         "Apache-2.0",
         "MIT",
-        "BSD-2-Clause",
         "Unicode-3.0",
         "CC0-1.0",
         "MIT-0",
@@ -154,6 +153,12 @@ fn supply_chain_policy_is_explicit_and_release_never_creates_tags() {
     assert!(!deny.to_ascii_lowercase().contains("unknown = \"allow\""));
     assert!(deny.contains("https://github.com/rust-lang/crates.io-index"));
 
+    let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+    assert!(ci.contains("permissions:\n  contents: read"));
+    assert!(ci.contains("persist-credentials: false"));
+    assert!(ci.contains("cargo deny check licenses sources bans advisories"));
+    assert!(ci.contains("--locked"));
+
     let release = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();
     assert!(release.contains("tags: [\"v*\"]"));
     assert!(release.contains("workflow_dispatch:"));
@@ -161,7 +166,9 @@ fn supply_chain_policy_is_explicit_and_release_never_creates_tags() {
     assert!(release.contains("x86_64-unknown-linux-gnu"));
     assert!(release.contains("x86_64-unknown-linux-musl"));
     assert!(release.contains("package-release.sh"));
-    assert!(release.contains("actions/upload-artifact@v4"));
+    assert!(release.contains("actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02"));
+    assert!(release.contains("actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683"));
+    assert!(release.contains("dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5"));
     assert!(!release.contains("git tag"));
     assert!(!release.contains("tag_name:"));
 }

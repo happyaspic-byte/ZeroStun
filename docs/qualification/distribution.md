@@ -14,9 +14,9 @@ requires 1.86. CI therefore tests the pin, not an MSRV compile pass. Raising
 the declared MSRV or replacing those crates without changing repository/state
 semantics is a later compatibility task, not this packaging phase.
 
-`deny.toml` allows only SPDX licenses present in the dependency graph: Apache
-2.0 (including LLVM exception), MIT, BSD-2-Clause, Unicode-3.0, CC0-1.0, MIT-0,
-and Unlicense. Unknown registries and Git sources are denied; only crates.io is
+`deny.toml` allows only SPDX licenses present in the current dependency graph:
+Apache-2.0 (including LLVM exception), MIT, Unicode-3.0, CC0-1.0, MIT-0, and
+Unlicense. Unknown registries and Git sources are denied; only crates.io is
 allowed. Wildcard dependencies are denied and duplicate versions are reported.
 
 ## Artifact contents
@@ -43,9 +43,11 @@ created under `TMPDIR` when set, so hosts with `/tmp` quota can still package.
 explicit `workflow_dispatch` packaging-test input (`mode=test`). It validates
 tag/version equality, tests the crate, builds GNU and musl x86_64 archives, and
 uploads short-lived workflow artifacts. It never creates a tag or GitHub
-release. Third-party actions use reviewed exact major tags; action updates
-require a source-policy review. `.github/workflows/ci.yml` installs the same
-Rust 1.97.1 pin.
+release. Third-party actions are pinned to immutable commit SHAs with the
+reviewed tag recorded only as a comment; action updates require a
+source-policy review. `.github/workflows/ci.yml` uses the same SHA-pinned
+Rust 1.97.1 action, `contents: read`, `persist-credentials: false`, `--locked`
+Cargo invocations, and `cargo deny`.
 
 No release or tag was created in this phase. Final release publication remains
 blocked on the full release gate and the required 24-hour soak.

@@ -47,6 +47,9 @@ done
 
 [[ $target =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "invalid target triple" >&2; exit 2; }
 [[ -n $output_dir ]] || { usage; exit 2; }
+[[ $output_dir != *..* ]] || { echo "output directory must not contain .." >&2; exit 2; }
+mkdir -p "$output_dir"
+output_dir=$(cd "$output_dir" && pwd)
 
 if [[ -z $binary ]]; then
   cargo build --manifest-path "$repo_root/Cargo.toml" --release --locked --offline --target "$target"

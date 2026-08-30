@@ -1,7 +1,8 @@
 name: release-artifacts
 
-# Third-party action policy: exact immutable major tags are used here; updates
-# are reviewed explicitly. This workflow never creates a tag or GitHub release.
+# Third-party action policy: every action is pinned to an immutable commit SHA.
+# Major tags are recorded only as comments. Updates require a source-policy
+# review. This workflow never creates a tag or GitHub release.
 on:
   push:
     tags: ["v*"]
@@ -33,10 +34,10 @@ jobs:
           - x86_64-unknown-linux-gnu
           - x86_64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.97.1
+      - uses: dtolnay/rust-toolchain@032958afbdc797a9164d3bc0b56325c1308924a5 # 1.97.1
         with:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
@@ -48,17 +49,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          version=$(python3 - <<'PY'
+          import tomllib
+          print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])
+          PY
+          )
           test "${GITHUB_REF_NAME}" = "v${version}"
       - name: Quality gates
         run: |
           cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo test --lib --bins --tests --all-features -- --test-threads=1
+          cargo clippy --all-targets --all-features --locked -- -D warnings
+          cargo test --lib --bins --tests --all-features --locked -- --test-threads=1
+          cargo install cargo-deny --locked --version 0.20.2
+          cargo deny check licenses sources bans advisories
       - name: Build package
         run: scripts/package-release.sh --target "${{ matrix.target }}" --output-dir dist
       - name: Upload archive and checksum
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: zerostun-${{ matrix.target }}
           path: dist/*
