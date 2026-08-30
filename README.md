@@ -50,12 +50,24 @@ were configured, so no live API mutation was attempted.
 
 ## Build
 
-Requires Rust 1.85+ (tested on 1.97.1).
+The declared MSRV policy is Rust 1.85; release builds are pinned to Rust 1.97.1.
+The current lockfile requires a later compiler through `redb`, `fastcdc`, and
+`criterion`, so MSRV 1.85 is documented rather than a passing compile gate.
 
 ```bash
-cargo build --release
+cargo build --release --locked
 ./target/release/zerostun --help
+
+# Local unpublished archive; never creates a tag or release.
+scripts/package-release.sh \
+  --target x86_64-unknown-linux-gnu \
+  --output-dir dist
+sha256sum -c dist/zerostun-*.tar.gz.sha256
 ```
+
+Archives include generated completions/man page, systemd/sample configuration,
+license files, and a CycloneDX SBOM. Installation, upgrade, rollback, and
+uninstall steps are documented in `docs/qualification/distribution.md`.
 
 ## Usage
 

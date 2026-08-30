@@ -1,0 +1,66 @@
+name: release-artifacts
+
+# Third-party action policy: exact immutable major tags are used here; updates
+# are reviewed explicitly. This workflow never creates a tag or GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Packaging test mode. Never publishes or creates tags.
+        required: true
+        default: test
+        type: choice
+        options:
+          - test
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  package:
+    name: package-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+      - name: Install musl compiler
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install --yes musl-tools
+      - name: Validate tag version
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          test "${GITHUB_REF_NAME}" = "v${version}"
+      - name: Quality gates
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --lib --bins --tests --all-features -- --test-threads=1
+      - name: Build package
+        run: scripts/package-release.sh --target "${{ matrix.target }}" --output-dir dist
+      - name: Upload archive and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: zerostun-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

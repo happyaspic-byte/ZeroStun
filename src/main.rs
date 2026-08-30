@@ -1,7 +1,10 @@
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode as StdExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, shells};
+use clap_mangen::Man;
 use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
@@ -113,6 +116,11 @@ enum Commands {
     Metrics {
         #[arg(long)]
         config: PathBuf,
+    },
+    #[command(name = "generate-assets", hide = true)]
+    GenerateAssets {
+        #[arg(long)]
+        output_dir: PathBuf,
     },
 }
 
@@ -454,7 +462,27 @@ async fn run(cli: Cli) -> zerostun::error::Result<ExitCode> {
             emit_json(&metrics)?;
             Ok(ExitCode::Success)
         }
+        Commands::GenerateAssets { output_dir } => {
+            generate_assets(&output_dir)?;
+            Ok(ExitCode::Success)
+        }
     }
+}
+
+fn generate_assets(output_dir: &Path) -> Result<(), Error> {
+    fs::create_dir_all(output_dir)?;
+    let mut command = Cli::command();
+    let name = command.get_name().to_string();
+    let mut bash = File::create(output_dir.join("zerostun.bash"))?;
+    generate(shells::Bash, &mut command, &name, &mut bash);
+    let mut zsh = File::create(output_dir.join("_zerostun"))?;
+    generate(shells::Zsh, &mut command, &name, &mut zsh);
+    let mut fish = File::create(output_dir.join("zerostun.fish"))?;
+    generate(shells::Fish, &mut command, &name, &mut fish);
+    Man::new(command)
+        .render(&mut File::create(output_dir.join("zerostun.1"))?)
+        .map_err(Error::Io)?;
+    Ok(())
 }
 
 async fn run_daemon(config: &DaemonConfig) -> zerostun::error::Result<ExitCode> {

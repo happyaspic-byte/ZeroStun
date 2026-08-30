@@ -1,0 +1,99 @@
+# Distribution and Supply-Chain Qualification
+
+Date: 2026-08-30
+Branch: `worktree-zerostun-core`
+Verification level: `local-and-ci`
+
+## Policy
+
+`rust-toolchain.toml` pins release and CI builds to Rust 1.97.1 with rustfmt and
+clippy. `Cargo.toml` retains the declared Rust 1.85 MSRV policy. The current
+locked graph cannot compile on 1.85.1: `redb 4.2.0` requires 1.90, `fastcdc
+5.0.0` uses the later `unsigned_is_multiple_of` API, and `criterion 0.8.2`
+requires 1.86. CI therefore tests the pin, not an MSRV compile pass. Raising
+the declared MSRV or replacing those crates without changing repository/state
+semantics is a later compatibility task, not this packaging phase.
+
+`deny.toml` allows only SPDX licenses present in the dependency graph: Apache
+2.0 (including LLVM exception), MIT, BSD-2-Clause, Unicode-3.0, CC0-1.0, MIT-0,
+and Unlicense. Unknown registries and Git sources are denied; only crates.io is
+allowed. Wildcard dependencies are denied and duplicate versions are reported.
+
+## Artifact contents
+
+`scripts/package-release.sh` creates a target-specific `.tar.gz` and adjacent
+SHA-256 checksum without publishing or creating a tag. The archive contains:
+
+- `bin/zerostun`
+- bash, zsh, and fish completions generated from the clap command model
+- a generated `zerostun(1)` man page
+- `zerostun-daemon.service` and `daemon.toml.example`
+- Apache-2.0 and MIT license texts
+- a CycloneDX 1.5 JSON SBOM generated from locked Cargo metadata
+
+Required local tools are Cargo/Rust, Bash, Python 3, GNU tar, gzip, `install`,
+and `sha256sum`. A musl build additionally needs the Rust musl target and
+`musl-gcc`. With dependencies cached, the script builds with `--locked
+--offline`; tests can inject an already-built binary. Temporary files are
+created under `TMPDIR` when set, so hosts with `/tmp` quota can still package.
+
+## Release workflow
+
+`.github/workflows/release.yml` runs only for an existing `v*` tag push or an
+explicit `workflow_dispatch` packaging-test input (`mode=test`). It validates
+tag/version equality, tests the crate, builds GNU and musl x86_64 archives, and
+uploads short-lived workflow artifacts. It never creates a tag or GitHub
+release. Third-party actions use reviewed exact major tags; action updates
+require a source-policy review. `.github/workflows/ci.yml` installs the same
+Rust 1.97.1 pin.
+
+No release or tag was created in this phase. Final release publication remains
+blocked on the full release gate and the required 24-hour soak.
+
+## Local verification
+
+| Gate | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | PASS |
+| `cargo clippy --all-targets --all-features --locked --offline -- -D warnings` | PASS |
+| `cargo test --lib --bins --tests --all-features --locked --offline -- --test-threads=1` | PASS: 199 passed, 0 failed, 0 ignored across 19 suites, including `release_packaging` |
+| `cargo build --release --locked --offline` | PASS |
+| `cargo audit --file Cargo.lock --no-fetch` | PASS: 185 dependency packages scanned, 0 vulnerabilities reported |
+| `cargo deny --offline check licenses sources bans advisories` | PASS: licenses, sources, and advisories denied-closed; duplicate crate versions reported as warn-only |
+
+A local unpublished GNU archive was produced with
+`scripts/package-release.sh` using `TMPDIR` in the workspace. Checksum
+verification and archive contents (binary, generated completions, man page,
+systemd unit, sample config, licenses, CycloneDX 1.5 SBOM) were inspected.
+musl packaging is exercised in CI when the musl compiler and target are
+available; this host did not have `musl-gcc` installed.
+
+## Operator installation
+
+1. Verify the archive from the same directory as its checksum:
+   `sha256sum -c zerostun-*.tar.gz.sha256`.
+2. Extract the archive and inspect the SBOM/license files.
+3. Install `bin/zerostun` to `/usr/bin/zerostun`.
+4. Install completions and `share/man/man1/zerostun.1` into the matching system
+   directories.
+5. Create the dedicated `zerostun` service account and writable
+   `/var/lib/zerostun` and `/run/zerostun` paths as required by local policy.
+6. Copy `daemon.toml.example` to `/etc/zerostun/daemon.toml`, replace the sample
+   target, then install and review the systemd unit before enabling it.
+7. Run `systemd-analyze verify` and `zerostun daemon status --config
+   /etc/zerostun/daemon.toml` before `systemctl enable --now`.
+
+## Upgrade and rollback
+
+Stop the daemon, back up `/etc/zerostun` and `/var/lib/zerostun`, verify the new
+archive, replace only the binary/assets, run `systemctl daemon-reload`, and
+restart. Keep the previous verified archive for rollback. Repository format
+upgrades are not performed implicitly by this package; use the qualification
+notes for the target version before replacing a production binary.
+
+## Uninstall
+
+Disable and stop the service, remove installed binary/assets/unit, and run
+`systemctl daemon-reload`. Preserve `/etc/zerostun` and `/var/lib/zerostun` by
+default. Delete configuration, state, repositories, and the service account only
+after a separate backup and explicit operator decision.
