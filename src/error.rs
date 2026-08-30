@@ -107,6 +107,9 @@ pub enum Error {
 
     #[error("critical repair finding: {0}")]
     CriticalRepair(String),
+
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
 }
 
 impl From<redb::Error> for Error {

@@ -12,6 +12,7 @@ pub mod lifecycle;
 pub mod manifest;
 pub mod rate_limit;
 pub mod repository;
+pub mod snapshot;
 pub mod source;
 pub mod telemetry;
 
