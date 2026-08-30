@@ -1172,7 +1172,11 @@ fn rollback_gc_moves(root: &Path, plan: &GcPlan) -> Result<()> {
 fn validate_recovery_live_set(db: &Database, plan: &GcPlan) -> Result<()> {
     let read_txn = db.begin_read()?;
     let backups = read_txn.open_table(TABLE_BACKUPS)?;
-    let tombstones = read_txn.open_table(TOMBSTONES)?;
+    let planned_tombstones: BTreeSet<_> = plan
+        .tombstones
+        .iter()
+        .map(|tombstone| tombstone.backup_id.as_str())
+        .collect();
     let reclaim: BTreeSet<_> = plan
         .reclaim_chunks
         .iter()
@@ -1181,7 +1185,7 @@ fn validate_recovery_live_set(db: &Database, plan: &GcPlan) -> Result<()> {
     for item in backups.iter()? {
         let (key, value) = item?;
         validate_backup_id(key.value())?;
-        if tombstones.get(key.value())?.is_some() {
+        if planned_tombstones.contains(key.value()) {
             continue;
         }
         let manifest = Manifest::decode(value.value())?;

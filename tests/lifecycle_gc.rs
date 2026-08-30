@@ -822,6 +822,63 @@ fn committed_recovery_refuses_chunk_that_became_live_after_crash() {
 }
 
 #[test]
+fn committed_recovery_refuses_chunk_that_became_tombstoned_after_crash() {
+    use zerostun::hash::root_hash_from_manifest;
+    use zerostun::manifest::{ChunkDescriptor, Manifest};
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let payload = b"became-tombstoned";
+    let cid = zerostun::hash::content_id_from_bytes(payload);
+    repo.write_chunk(&cid, CompressionCodec::None, payload)
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let trash = repo.root().join(&item.trash);
+    std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    std::fs::rename(repo.chunk_path(&cid), &trash).unwrap();
+    drop(repo);
+    insert_journal(
+        &repo_path,
+        &GcJournal {
+            plan,
+            phase: GcPhase::Committed,
+            moved: vec![cid.to_hex()],
+        },
+        GC_JOURNALS,
+    );
+    std::fs::remove_file(&trash).unwrap();
+    let repo = Repository::open(&repo_path).unwrap();
+    repo.write_chunk(&cid, CompressionCodec::None, payload)
+        .unwrap();
+    let mut manifest = Manifest::new("backup-new-tombstoned", payload.len() as u64, 64, 128, 256);
+    manifest.add_chunk(ChunkDescriptor {
+        index: 0,
+        logical_offset: 0,
+        original_length: payload.len() as u64,
+        stored_length: payload.len() as u64,
+        codec: CompressionCodec::None,
+        content_id: cid,
+    });
+    manifest.root_hash = root_hash_from_manifest(&manifest);
+    repo.commit_manifest(&manifest).unwrap();
+    repo.apply_delete(&repo.plan_delete("backup-new-tombstoned").unwrap())
+        .unwrap();
+    drop(repo);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    assert!(reopened.recover_gc().is_err());
+    assert!(reopened.chunk_path(&cid).exists());
+    reopened
+        .apply_undelete(&reopened.plan_undelete("backup-new-tombstoned").unwrap())
+        .unwrap();
+    assert!(reopened.load_manifest("backup-new-tombstoned").is_ok());
+}
+
+#[test]
 fn reader_lease_refuses_atomic_gc_barrier() {
     const GC_STATE: TableDefinition<&str, u8> = TableDefinition::new("gc_state");
     let fixture = futures_lite_backup_fixture();
