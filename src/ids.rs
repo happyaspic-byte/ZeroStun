@@ -154,7 +154,12 @@ pub fn generate_backup_id() -> String {
 }
 
 pub fn validate_backup_id(id: &str) -> Result<()> {
-    let id = id.trim();
+    let trimmed = id.trim();
+    if id != trimmed {
+        return Err(Error::InvalidIdentifier(
+            "backup ID must not have leading or trailing whitespace".to_string(),
+        ));
+    }
     if id.is_empty() || id.len() > 64 {
         return Err(Error::InvalidIdentifier(
             "backup ID length must be between 1 and 64".to_string(),

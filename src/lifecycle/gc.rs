@@ -6,9 +6,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 
 pub const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
-pub const MAX_GC_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+pub const GC_STATE: TableDefinition<&str, u8> = TableDefinition::new("gc_state");
+pub const GC_BARRIER_KEY: &str = "barrier";
+pub const GC_BARRIER_VALUE: u8 = 1;
+pub const MAX_GC_JOURNAL_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_GC_CHUNKS: usize = 1_000_000;
-pub const GC_MOVE_BATCH_SIZE: usize = 128;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkMove {
@@ -47,13 +49,14 @@ pub enum GcPhase {
 pub struct GcJournal {
     pub plan: GcPlan,
     pub phase: GcPhase,
-    /// Content IDs from the most recently durably checkpointed batch (maximum 128).
+    /// Legacy cumulative moved IDs. New journals keep this empty because source/trash state is authoritative.
+    #[serde(default)]
     pub moved: Vec<String>,
 }
 
 impl GcJournal {
     pub fn encode(&self) -> Result<Vec<u8>> {
-        if self.plan.reclaim_chunks.len() > MAX_GC_CHUNKS || self.moved.len() > GC_MOVE_BATCH_SIZE {
+        if self.plan.reclaim_chunks.len() > MAX_GC_CHUNKS || self.moved.len() > MAX_GC_CHUNKS {
             return Err(Error::GarbageCollection(
                 "GC journal chunk count exceeds bounded maximum".to_string(),
             ));
@@ -78,8 +81,7 @@ impl GcJournal {
         let journal: Self = serde_json::from_slice(bytes).map_err(|error| {
             Error::GarbageCollection(format!("GC journal decode failed: {error}"))
         })?;
-        if journal.plan.reclaim_chunks.len() > MAX_GC_CHUNKS
-            || journal.moved.len() > GC_MOVE_BATCH_SIZE
+        if journal.plan.reclaim_chunks.len() > MAX_GC_CHUNKS || journal.moved.len() > MAX_GC_CHUNKS
         {
             return Err(Error::GarbageCollection(
                 "GC journal chunk count exceeds bounded maximum".to_string(),

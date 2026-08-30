@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,13 +16,14 @@ use crate::lifecycle::delete::{
     DeletePlan, DeleteResult, UndeletePlan, UndeleteResult, TOMBSTONES,
 };
 use crate::lifecycle::gc::{
-    ChunkMove, GcJournal, GcPhase, GcPlan, GcRecoveryResult, GcResult, GcTombstone, GC_JOURNALS,
+    ChunkMove, GcJournal, GcPhase, GcPlan, GcRecoveryResult, GcResult, GcTombstone, GC_BARRIER_KEY,
+    GC_BARRIER_VALUE, GC_JOURNALS, GC_STATE, MAX_GC_CHUNKS,
 };
 use crate::lifecycle::lease::{
     insert_reader_lease, is_process_stale, read_active_reader_leases, ReaderLease,
     ReaderLeaseGuard, READER_LEASES,
 };
-use crate::manifest::Manifest;
+use crate::manifest::{ChunkDescriptor, Manifest};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupSummaryItem {
@@ -113,6 +114,7 @@ impl Repository {
                     let _ = write_txn.open_table(TOMBSTONES)?;
                     let _ = write_txn.open_table(READER_LEASES)?;
                     let _ = write_txn.open_table(GC_JOURNALS)?;
+                    let _ = write_txn.open_table(GC_STATE)?;
                 }
                 write_txn.commit()?;
             }
@@ -127,6 +129,7 @@ impl Repository {
                     let _ = write_txn.open_table(TOMBSTONES)?;
                     let _ = write_txn.open_table(READER_LEASES)?;
                     let _ = write_txn.open_table(GC_JOURNALS)?;
+                    let _ = write_txn.open_table(GC_STATE)?;
                 }
                 write_txn.commit()?;
             }
@@ -136,8 +139,10 @@ impl Repository {
             publish_repository_version(path, &version_file)?;
         }
 
+        let root = fs::canonicalize(path)?;
+        validate_repository_directories(&root)?;
         Ok(Self {
-            root: path.to_path_buf(),
+            root,
             db: Arc::new(db),
         })
     }
@@ -165,10 +170,12 @@ impl Repository {
                 supported: REPO_FORMAT_VERSION,
             });
         }
-        let db_path = path.join(REPO_DB_FILE);
+        let root = fs::canonicalize(path)?;
+        validate_repository_directories(&root)?;
+        let db_path = root.join(REPO_DB_FILE);
         let db = Database::open(db_path)?;
         Ok(Self {
-            root: path.to_path_buf(),
+            root,
             db: Arc::new(db),
         })
     }
@@ -437,6 +444,14 @@ impl Repository {
             drop(tombstones);
             Manifest::decode(&bytes)?
         };
+        {
+            let state = write_txn.open_table(GC_STATE)?;
+            if state.get(GC_BARRIER_KEY)?.is_some() {
+                return Err(Error::GarbageCollection(
+                    "reader lease refused while garbage collection barrier is held".to_string(),
+                ));
+            }
+        }
         let (_, lease_id) = insert_reader_lease(&write_txn, backup_id)?;
         write_txn.commit()?;
         Ok((
@@ -479,7 +494,7 @@ impl Repository {
         }
         let backups = read_txn.open_table(TABLE_BACKUPS)?;
         let tombstones = read_txn.open_table(TOMBSTONES)?;
-        let mut live = BTreeSet::new();
+        let mut live = BTreeMap::new();
         let mut planned_tombstones = Vec::new();
         for item in backups.iter()? {
             let (key, value) = item?;
@@ -499,7 +514,19 @@ impl Repository {
                 });
                 continue;
             }
-            live.extend(manifest.chunks.into_iter().map(|chunk| chunk.content_id));
+            for chunk in manifest.chunks {
+                if let Some(existing) = live.insert(chunk.content_id, chunk.clone()) {
+                    if existing.codec != chunk.codec
+                        || existing.original_length != chunk.original_length
+                        || existing.stored_length != chunk.stored_length
+                    {
+                        return Err(Error::ManifestCorrupt(format!(
+                            "live metadata disagrees for chunk {}",
+                            chunk.content_id
+                        )));
+                    }
+                }
+            }
         }
         for item in tombstones.iter()? {
             let (key, _) = item?;
@@ -512,12 +539,20 @@ impl Repository {
             }
         }
         planned_tombstones.sort();
-        for content_id in &live {
-            if !self.chunk_path(content_id).is_file() {
-                return Err(Error::ChunkMissing {
-                    content_id: content_id.to_hex(),
-                });
-            }
+        for (content_id, descriptor) in &live {
+            let path = self.chunk_path(content_id);
+            let bytes = fs::symlink_metadata(&path)
+                .map(|metadata| metadata.len())
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Error::ChunkMissing {
+                            content_id: content_id.to_hex(),
+                        }
+                    } else {
+                        error.into()
+                    }
+                })?;
+            validate_chunk_file(&path, content_id, Some(descriptor), bytes)?;
         }
 
         let gc_id = self.allocate_gc_id()?;
@@ -553,10 +588,17 @@ impl Repository {
                     )));
                 }
                 let content_id = ContentId::parse(&format!("{prefix}{rest}"))?;
-                if live.contains(&content_id) {
+                if live.contains_key(&content_id) {
                     continue;
                 }
+                if reclaim_chunks.len() == MAX_GC_CHUNKS {
+                    return Err(Error::GarbageCollection(
+                        "GC inventory exceeds bounded chunk maximum".to_string(),
+                    ));
+                }
                 let bytes = chunk_entry.metadata()?.len();
+                validate_chunk_ancestor(&self.root, &chunk_entry.path())?;
+                validate_chunk_file(&chunk_entry.path(), &content_id, None, bytes)?;
                 reclaim_chunks.push(ChunkMove {
                     content_id: content_id.to_hex(),
                     source: PathBuf::from(REPO_CHUNKS_DIR).join(&prefix).join(&rest),
@@ -596,41 +638,30 @@ impl Repository {
         let current = self.plan_gc()?;
         validate_gc_plan(plan, &current, &self.root)?;
         ensure_gc_namespace_available(&self.db, &self.root, &plan.gc_id)?;
-        if !self.active_reader_leases()?.is_empty() {
-            return Err(Error::GarbageCollection(
-                "garbage collection refused while active reader leases exist".to_string(),
-            ));
-        }
-        let mut journal = GcJournal {
+        ensure_confined_real_directory(&self.root, &self.root.join(REPO_MANIFESTS_DIR))?;
+        let journal = GcJournal {
             plan: plan.clone(),
-            phase: GcPhase::Planned,
+            phase: GcPhase::Moving,
             moved: Vec::new(),
         };
-        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
-        journal.phase = GcPhase::Moving;
-        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
+        install_gc_barrier_and_journal(&self.db, &self.root, &journal)?;
         for (index, item) in plan.reclaim_chunks.iter().enumerate() {
             let source = self.root.join(&item.source);
             let trash = self.root.join(&item.trash);
             ensure_gc_trash_parent(&self.root, plan, item)?;
-            validate_regular_file(&source, item.bytes)?;
+            validate_chunk_ancestor(&self.root, &source)?;
+            validate_stored_chunk_file(&source, item)?;
             validate_gc_trash_parent(&self.root, plan, item)?;
             fs::rename(&source, &trash)?;
-            sync_directory(source.parent().unwrap_or(&self.root))?;
             sync_directory(trash.parent().unwrap_or(&self.root))?;
+            sync_directory(source.parent().unwrap_or(&self.root))?;
             if fault == Some(GcFaultPoint::AfterRename(index + 1)) {
                 return Err(Error::GarbageCollection(
                     "injected GC fault after rename".to_string(),
                 ));
             }
-            journal.moved.push(item.content_id.clone());
-            if journal.moved.len() == crate::lifecycle::gc::GC_MOVE_BATCH_SIZE
-                || index + 1 == plan.reclaim_chunks.len()
-            {
-                persist_gc_journal_durable(&self.db, &self.root, &journal)?;
-                journal.moved.clear();
-            }
         }
+        let mut journal = journal;
         journal.phase = GcPhase::Committed;
         persist_gc_journal_durable(&self.db, &self.root, &journal)?;
         if fault == Some(GcFaultPoint::AfterCommitted) {
@@ -638,12 +669,10 @@ impl Repository {
                 "injected GC fault after committed marker".to_string(),
             ));
         }
-        journal.phase = GcPhase::Deleting;
-        persist_gc_journal_durable(&self.db, &self.root, &journal)?;
         delete_gc_trash(&self.root, plan)?;
         self.finalize_gc_tombstones(&plan.tombstones)?;
-        journal.phase = GcPhase::Complete;
-        remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
+        remove_gc_trash_directories(&self.root, plan)?;
+        remove_gc_journal_and_barrier(&self.db, &self.root, &plan.gc_id)?;
         Ok(GcResult {
             gc_id: plan.gc_id.clone(),
             reclaimed_chunks: plan.reclaim_chunks.len() as u64,
@@ -676,30 +705,23 @@ impl Repository {
             validate_gc_journal_plan(&journal.plan, &self.root)?;
             match journal.phase {
                 GcPhase::Planned | GcPhase::Moving => {
+                    ensure_gc_barrier(&self.db)?;
                     rollback_gc_moves(&self.root, &journal.plan)?;
-                    remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
+                    remove_gc_trash_directories(&self.root, &journal.plan)?;
+                    remove_gc_journal_and_barrier(&self.db, &self.root, &journal.plan.gc_id)?;
                 }
                 GcPhase::Committed | GcPhase::Deleting => {
-                    if !self.active_reader_leases()?.is_empty() {
-                        return Err(Error::GarbageCollection(
-                            "garbage collection recovery refused while active reader leases exist"
-                                .to_string(),
-                        ));
-                    }
+                    ensure_gc_barrier(&self.db)?;
+                    validate_recovery_live_set(&self.db, &journal.plan)?;
                     journal.phase = GcPhase::Deleting;
-                    persist_gc_journal_durable(&self.db, &self.root, &journal)?;
                     delete_gc_trash(&self.root, &journal.plan)?;
-                    if !self.active_reader_leases()?.is_empty() {
-                        return Err(Error::GarbageCollection(
-                            "garbage collection recovery refused while active reader leases exist"
-                                .to_string(),
-                        ));
-                    }
                     self.finalize_gc_tombstones(&journal.plan.tombstones)?;
-                    remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
+                    remove_gc_trash_directories(&self.root, &journal.plan)?;
+                    remove_gc_journal_and_barrier(&self.db, &self.root, &journal.plan.gc_id)?;
                 }
                 GcPhase::Complete => {
-                    remove_gc_journal(&self.db, &self.root, &journal.plan.gc_id)?;
+                    remove_gc_trash_directories(&self.root, &journal.plan)?;
+                    remove_gc_journal_and_barrier(&self.db, &self.root, &journal.plan.gc_id)?;
                 }
             }
             results.push(GcRecoveryResult {
@@ -714,6 +736,7 @@ impl Repository {
     }
 
     fn finalize_gc_tombstones(&self, planned: &[GcTombstone]) -> Result<()> {
+        ensure_confined_real_directory(&self.root, &self.root.join(REPO_MANIFESTS_DIR))?;
         match tombstone_set_status(&self.db, planned)? {
             TombstoneSetStatus::Pending => {}
             TombstoneSetStatus::Finalized => return Ok(()),
@@ -726,8 +749,14 @@ impl Repository {
                 .root
                 .join(REPO_MANIFESTS_DIR)
                 .join(format!("{}.manifest", tombstone.backup_id));
-            match fs::remove_file(manifest) {
-                Ok(()) => {}
+            match fs::symlink_metadata(&manifest) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(Error::GarbageCollection(format!(
+                        "GC manifest copy is not a regular file: {}",
+                        manifest.display()
+                    )))
+                }
+                Ok(_) => fs::remove_file(&manifest)?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -883,6 +912,66 @@ fn tombstone_set_status(db: &Database, planned: &[GcTombstone]) -> Result<Tombst
     ))
 }
 
+fn install_gc_barrier_and_journal(db: &Database, root: &Path, journal: &GcJournal) -> Result<()> {
+    let bytes = journal.encode()?;
+    let write_txn = db.begin_write()?;
+    {
+        let leases = write_txn.open_table(READER_LEASES)?;
+        if leases.iter()?.next().is_some() {
+            return Err(Error::GarbageCollection(
+                "garbage collection refused while active reader leases exist".to_string(),
+            ));
+        }
+        drop(leases);
+        let mut state = write_txn.open_table(GC_STATE)?;
+        if let Some(existing) = state.get(GC_BARRIER_KEY)? {
+            if existing.value() != GC_BARRIER_VALUE {
+                return Err(Error::GarbageCollection(
+                    "invalid garbage collection barrier state".to_string(),
+                ));
+            }
+            return Err(Error::GarbageCollection(format!(
+                "garbage collection barrier already held before {}",
+                journal.plan.gc_id
+            )));
+        }
+        state.insert(GC_BARRIER_KEY, GC_BARRIER_VALUE)?;
+        drop(state);
+        let mut journals = write_txn.open_table(GC_JOURNALS)?;
+        journals.insert(journal.plan.gc_id.as_str(), bytes.as_slice())?;
+    }
+    write_txn.commit()?;
+    sync_database_parent(root)
+}
+
+fn ensure_gc_barrier(db: &Database) -> Result<()> {
+    let write_txn = db.begin_write()?;
+    {
+        let leases = write_txn.open_table(READER_LEASES)?;
+        if leases.iter()?.next().is_some() {
+            return Err(Error::GarbageCollection(
+                "garbage collection recovery refused while active reader leases exist".to_string(),
+            ));
+        }
+        drop(leases);
+        let mut state = write_txn.open_table(GC_STATE)?;
+        let barrier = state.get(GC_BARRIER_KEY)?.map(|value| value.value());
+        match barrier {
+            Some(value) if value == GC_BARRIER_VALUE => {}
+            Some(_) => {
+                return Err(Error::GarbageCollection(
+                    "invalid garbage collection barrier state".to_string(),
+                ))
+            }
+            None => {
+                state.insert(GC_BARRIER_KEY, GC_BARRIER_VALUE)?;
+            }
+        }
+    }
+    write_txn.commit()?;
+    Ok(())
+}
+
 fn persist_gc_journal(db: &Database, journal: &GcJournal) -> Result<()> {
     let bytes = journal.encode()?;
     let write_txn = db.begin_write()?;
@@ -899,14 +988,37 @@ fn persist_gc_journal_durable(db: &Database, root: &Path, journal: &GcJournal) -
     sync_database_parent(root)
 }
 
-fn remove_gc_journal(db: &Database, root: &Path, gc_id: &str) -> Result<()> {
+fn remove_gc_journal_and_barrier(db: &Database, root: &Path, gc_id: &str) -> Result<()> {
     let write_txn = db.begin_write()?;
     {
-        let mut table = write_txn.open_table(GC_JOURNALS)?;
-        let _ = table.remove(gc_id)?;
+        let mut journals = write_txn.open_table(GC_JOURNALS)?;
+        let _ = journals.remove(gc_id)?;
+        drop(journals);
+        let mut state = write_txn.open_table(GC_STATE)?;
+        let _ = state.remove(GC_BARRIER_KEY)?;
     }
     write_txn.commit()?;
     sync_database_parent(root)
+}
+
+fn validate_repository_directories(root: &Path) -> Result<()> {
+    ensure_confined_real_directory(root, root)?;
+    for directory in [REPO_CHUNKS_DIR, REPO_MANIFESTS_DIR, REPO_TMP_DIR] {
+        ensure_confined_real_directory(root, &root.join(directory))?;
+    }
+    Ok(())
+}
+
+fn ensure_confined_real_directory(root: &Path, path: &Path) -> Result<()> {
+    ensure_real_directory(path)?;
+    let canonical = fs::canonicalize(path)?;
+    if !canonical.starts_with(root) {
+        return Err(Error::GarbageCollection(format!(
+            "GC directory escapes repository root: {}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn ensure_real_directory(path: &Path) -> Result<()> {
@@ -920,14 +1032,14 @@ fn ensure_real_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_and_sync_directory(parent: &Path, child: &Path) -> Result<()> {
-    ensure_real_directory(parent)?;
+fn create_and_sync_directory(root: &Path, parent: &Path, child: &Path) -> Result<()> {
+    ensure_confined_real_directory(root, parent)?;
     match fs::symlink_metadata(child) {
-        Ok(_) => ensure_real_directory(child),
+        Ok(_) => ensure_confined_real_directory(root, child),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             fs::create_dir(child)?;
             sync_directory(parent)?;
-            ensure_real_directory(child)
+            ensure_confined_real_directory(root, child)
         }
         Err(error) => Err(error.into()),
     }
@@ -941,24 +1053,24 @@ fn validate_gc_trash_parent(root: &Path, plan: &GcPlan, item: &ChunkMove) -> Res
         .parent()
         .and_then(Path::file_name)
         .ok_or_else(|| Error::GarbageCollection("invalid GC trash prefix".to_string()))?;
-    ensure_real_directory(root)?;
-    ensure_real_directory(&trash_root)?;
-    ensure_real_directory(&gc_root)?;
-    ensure_real_directory(&gc_root.join(prefix))
+    ensure_confined_real_directory(root, root)?;
+    ensure_confined_real_directory(root, &trash_root)?;
+    ensure_confined_real_directory(root, &gc_root)?;
+    ensure_confined_real_directory(root, &gc_root.join(prefix))
 }
 
 fn ensure_gc_trash_parent(root: &Path, plan: &GcPlan, item: &ChunkMove) -> Result<()> {
     ensure_real_directory(root)?;
     let trash_root = root.join(REPO_TRASH_DIR);
-    create_and_sync_directory(root, &trash_root)?;
+    create_and_sync_directory(root, root, &trash_root)?;
     let gc_root = trash_root.join(&plan.gc_id);
-    create_and_sync_directory(&trash_root, &gc_root)?;
+    create_and_sync_directory(root, &trash_root, &gc_root)?;
     let prefix = item
         .trash
         .parent()
         .and_then(Path::file_name)
         .ok_or_else(|| Error::GarbageCollection("invalid GC trash prefix".to_string()))?;
-    create_and_sync_directory(&gc_root, &gc_root.join(prefix))?;
+    create_and_sync_directory(root, &gc_root, &gc_root.join(prefix))?;
     validate_gc_trash_parent(root, plan, item)
 }
 
@@ -988,16 +1100,21 @@ fn rollback_gc_moves(root: &Path, plan: &GcPlan) -> Result<()> {
             }
             (false, true) => {
                 validate_gc_trash_parent(root, plan, item)?;
-                validate_regular_file(&trash, item.bytes)?;
+                let content_id = ContentId::parse(&item.content_id)?;
+                validate_chunk_file(&trash, &content_id, None, item.bytes)?;
                 let source_parent = source.parent().ok_or_else(|| {
                     Error::GarbageCollection("invalid GC source parent".to_string())
                 })?;
-                ensure_real_directory(source_parent)?;
+                ensure_confined_real_directory(root, source_parent)?;
                 fs::rename(&trash, &source)?;
                 sync_directory(source.parent().unwrap_or(root))?;
                 sync_directory(trash.parent().unwrap_or(root))?;
             }
-            (true, false) => {}
+            (true, false) => {
+                validate_chunk_ancestor(root, &source)?;
+                let content_id = ContentId::parse(&item.content_id)?;
+                validate_chunk_file(&source, &content_id, None, item.bytes)?;
+            }
             (false, false) => {
                 return Err(Error::GarbageCollection(format!(
                     "missing source and trash copies for uncommitted chunk {}",
@@ -1007,6 +1124,60 @@ fn rollback_gc_moves(root: &Path, plan: &GcPlan) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_recovery_live_set(db: &Database, plan: &GcPlan) -> Result<()> {
+    let read_txn = db.begin_read()?;
+    let backups = read_txn.open_table(TABLE_BACKUPS)?;
+    let tombstones = read_txn.open_table(TOMBSTONES)?;
+    let reclaim: BTreeSet<_> = plan
+        .reclaim_chunks
+        .iter()
+        .map(|item| ContentId::parse(&item.content_id))
+        .collect::<Result<_>>()?;
+    for item in backups.iter()? {
+        let (key, value) = item?;
+        validate_backup_id(key.value())?;
+        if tombstones.get(key.value())?.is_some() {
+            continue;
+        }
+        let manifest = Manifest::decode(value.value())?;
+        if manifest.backup_id != key.value() {
+            return Err(Error::ManifestCorrupt(format!(
+                "backup index key {} does not match manifest ID {}",
+                key.value(),
+                manifest.backup_id
+            )));
+        }
+        if let Some(chunk) = manifest
+            .chunks
+            .iter()
+            .find(|chunk| reclaim.contains(&chunk.content_id))
+        {
+            return Err(Error::GarbageCollection(format!(
+                "recovery refuses chunk {} because it became live",
+                chunk.content_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn remove_gc_trash_directories(root: &Path, plan: &GcPlan) -> Result<()> {
+    let trash_root = root.join(REPO_TRASH_DIR);
+    let gc_root = trash_root.join(&plan.gc_id);
+    if !gc_root.exists() {
+        return Ok(());
+    }
+    ensure_confined_real_directory(root, &trash_root)?;
+    ensure_confined_real_directory(root, &gc_root)?;
+    for entry in fs::read_dir(&gc_root)? {
+        let entry = entry?;
+        ensure_confined_real_directory(root, &entry.path())?;
+        fs::remove_dir(entry.path())?;
+    }
+    fs::remove_dir(&gc_root)?;
+    sync_directory(&root.join(REPO_TRASH_DIR))
 }
 
 fn delete_gc_trash(root: &Path, plan: &GcPlan) -> Result<()> {
@@ -1023,15 +1194,18 @@ fn delete_gc_trash(root: &Path, plan: &GcPlan) -> Result<()> {
         }
         if source_exists {
             ensure_gc_trash_parent(root, plan, item)?;
-            validate_regular_file(&source, item.bytes)?;
+            validate_chunk_ancestor(root, &source)?;
+            let content_id = ContentId::parse(&item.content_id)?;
+            validate_chunk_file(&source, &content_id, None, item.bytes)?;
             validate_gc_trash_parent(root, plan, item)?;
             fs::rename(&source, &trash)?;
-            sync_directory(source.parent().unwrap_or(root))?;
             sync_directory(trash.parent().unwrap_or(root))?;
+            sync_directory(source.parent().unwrap_or(root))?;
         }
         if trash_exists {
             validate_gc_trash_parent(root, plan, item)?;
-            validate_regular_file(&trash, item.bytes)?;
+            let content_id = ContentId::parse(&item.content_id)?;
+            validate_chunk_file(&trash, &content_id, None, item.bytes)?;
         }
         match fs::remove_file(&trash) {
             Ok(()) => sync_directory(trash.parent().unwrap_or(root))?,
@@ -1058,9 +1232,22 @@ fn sync_database_parent(root: &Path) -> Result<()> {
     sync_directory(root)
 }
 
+fn validate_chunk_ancestor(root: &Path, path: &Path) -> Result<()> {
+    ensure_confined_real_directory(root, &root.join(REPO_CHUNKS_DIR))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::GarbageCollection("invalid chunk parent directory".to_string()))?;
+    ensure_confined_real_directory(root, parent)
+}
+
 fn validate_gc_journal_plan(plan: &GcPlan, root: &Path) -> Result<()> {
     if validate_backup_id(&plan.gc_id).is_err() || !plan.gc_id.starts_with("gc-") {
         return Err(Error::GarbageCollection("invalid GC ID".to_string()));
+    }
+    if plan.reclaim_chunks.len() > MAX_GC_CHUNKS {
+        return Err(Error::GarbageCollection(
+            "GC plan exceeds bounded chunk maximum".to_string(),
+        ));
     }
     for item in &plan.reclaim_chunks {
         let cid = ContentId::parse(&item.content_id)?;
@@ -1079,6 +1266,13 @@ fn validate_gc_journal_plan(plan: &GcPlan, root: &Path) -> Result<()> {
         }
         let source = root.join(&item.source);
         let trash = root.join(&item.trash);
+        let chunks_root = root.join(REPO_CHUNKS_DIR);
+        ensure_confined_real_directory(root, &chunks_root)?;
+        let source_parent = source
+            .parent()
+            .ok_or_else(|| Error::GarbageCollection("invalid GC source parent".to_string()))?;
+        ensure_confined_real_directory(root, source_parent)?;
+        ensure_confined_real_directory(root, &root.join(REPO_MANIFESTS_DIR))?;
         for path in [&source, &trash] {
             match fs::symlink_metadata(path) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1102,49 +1296,107 @@ fn validate_gc_journal_plan(plan: &GcPlan, root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_stored_chunk_file(path: &Path, item: &ChunkMove) -> Result<()> {
-    use crate::codec::{STORED_CHUNK_HEADER_LEN, STORED_CHUNK_MAGIC, STORED_CHUNK_VERSION};
+fn validate_chunk_file(
+    path: &Path,
+    content_id: &ContentId,
+    descriptor: Option<&ChunkDescriptor>,
+    bytes: u64,
+) -> Result<()> {
+    use crate::codec::{Compressor, MAX_ORIGINAL_CHUNK_BYTES, STORED_CHUNK_HEADER_LEN};
+    use crate::hash::content_id_from_bytes;
 
-    let mut file = File::open(path)?;
-    let mut header = [0_u8; STORED_CHUNK_HEADER_LEN];
-    file.read_exact(&mut header)
-        .map_err(|error| Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: error.to_string(),
+    validate_regular_file(path, bytes)?;
+    let max_stored = MAX_ORIGINAL_CHUNK_BYTES
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(STORED_CHUNK_HEADER_LEN as u64))
+        .ok_or_else(|| Error::ChunkCorrupt {
+            content_id: content_id.to_hex(),
+            reason: "stored chunk bound overflow".to_string(),
         })?;
-    if &header[..8] != STORED_CHUNK_MAGIC {
+    if bytes > max_stored {
         return Err(Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: "invalid stored chunk magic".to_string(),
+            content_id: content_id.to_hex(),
+            reason: "stored chunk exceeds bounded maximum".to_string(),
         });
     }
-    let version =
-        u32::from_le_bytes(header[8..12].try_into().map_err(|_| Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: "invalid stored chunk version".to_string(),
-        })?);
-    if version != STORED_CHUNK_VERSION {
-        return Err(Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: "unsupported stored chunk version".to_string(),
-        });
-    }
-    CompressionCodec::from_tag(header[12]).map_err(|error| Error::ChunkCorrupt {
-        content_id: item.content_id.clone(),
+    let encoded = fs::read(path).map_err(|error| Error::ChunkCorrupt {
+        content_id: content_id.to_hex(),
         reason: error.to_string(),
     })?;
-    let payload_len =
-        u64::from_le_bytes(header[16..24].try_into().map_err(|_| Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: "invalid stored chunk payload length".to_string(),
-        })?);
-    if payload_len.checked_add(STORED_CHUNK_HEADER_LEN as u64) != Some(item.bytes) {
+    let stored = StoredChunk::decode(&encoded).map_err(|error| Error::ChunkCorrupt {
+        content_id: content_id.to_hex(),
+        reason: error.to_string(),
+    })?;
+    if let Some(chunk) = descriptor {
+        if chunk.original_length > MAX_ORIGINAL_CHUNK_BYTES {
+            return Err(Error::ChunkCorrupt {
+                content_id: content_id.to_hex(),
+                reason: "original chunk exceeds bounded maximum".to_string(),
+            });
+        }
+        if chunk.codec != stored.codec || chunk.stored_length != stored.payload.len() as u64 {
+            return Err(Error::ChunkCorrupt {
+                content_id: content_id.to_hex(),
+                reason: "stored chunk metadata does not match manifest".to_string(),
+            });
+        }
+    }
+    let raw = match descriptor {
+        Some(chunk) => Compressor::decompress(
+            stored.codec,
+            &stored.payload,
+            chunk.original_length as usize,
+        ),
+        None => decompress_chunk_bounded(stored.codec, &stored.payload),
+    }
+    .map_err(|error| Error::ChunkCorrupt {
+        content_id: content_id.to_hex(),
+        reason: error.to_string(),
+    })?;
+    if content_id_from_bytes(&raw) != *content_id {
         return Err(Error::ChunkCorrupt {
-            content_id: item.content_id.clone(),
-            reason: "stored chunk length mismatch".to_string(),
+            content_id: content_id.to_hex(),
+            reason: "stored chunk payload does not match path content ID".to_string(),
         });
     }
     Ok(())
+}
+
+fn decompress_chunk_bounded(codec: CompressionCodec, payload: &[u8]) -> Result<Vec<u8>> {
+    use crate::codec::MAX_ORIGINAL_CHUNK_BYTES;
+
+    match codec {
+        CompressionCodec::None => Ok(payload.to_vec()),
+        CompressionCodec::Zstd { .. } => {
+            let decoder = zstd::stream::Decoder::new(payload)
+                .map_err(|error| Error::Decompression(error.to_string()))?;
+            read_to_end_bounded(decoder, MAX_ORIGINAL_CHUNK_BYTES as usize)
+        }
+        CompressionCodec::Lz4 => {
+            let decoder = lz4_flex::frame::FrameDecoder::new(payload);
+            read_to_end_bounded(decoder, MAX_ORIGINAL_CHUNK_BYTES as usize)
+        }
+    }
+}
+
+fn read_to_end_bounded(mut reader: impl Read, maximum: usize) -> Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    reader
+        .by_ref()
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| Error::Decompression(error.to_string()))?;
+    if raw.len() > maximum {
+        return Err(Error::Decompression(
+            "decompressed chunk exceeds bounded maximum".to_string(),
+        ));
+    }
+    Ok(raw)
+}
+
+fn validate_stored_chunk_file(path: &Path, item: &ChunkMove) -> Result<()> {
+    let content_id = ContentId::parse(&item.content_id)?;
+    validate_chunk_file(path, &content_id, None, item.bytes)
 }
 
 fn validate_gc_plan(plan: &GcPlan, current: &GcPlan, root: &Path) -> Result<()> {

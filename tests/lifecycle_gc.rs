@@ -719,6 +719,194 @@ fn insert_journal(
     write.commit().unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn gc_rejects_symlinked_chunk_prefix_without_touching_external_sentinel() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let payload = b"prefix-orphan";
+    let cid = zerostun::hash::content_id_from_bytes(payload);
+    repo.write_chunk(&cid, CompressionCodec::None, payload)
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let prefix = repo_path.join("chunks").join(&cid.to_hex()[..2]);
+    let external = temp.path().join("external-prefix");
+    std::fs::create_dir(&external).unwrap();
+    let sentinel = external.join("sentinel");
+    std::fs::write(&sentinel, b"untouched").unwrap();
+    let external_chunk = external.join(&cid.to_hex()[2..]);
+    std::fs::rename(repo.chunk_path(&cid), &external_chunk).unwrap();
+    std::fs::remove_dir(&prefix).unwrap();
+    symlink(&external, &prefix).unwrap();
+
+    assert!(repo.apply_gc(&plan).is_err());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+    assert!(external_chunk.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn gc_rejects_symlinked_manifests_directory_without_touching_external_sentinel() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let ids = commit_payloads(&repo, "backup-doomed", &[b"owned"]);
+    repo.apply_delete(&repo.plan_delete("backup-doomed").unwrap())
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let external = temp.path().join("external-manifests");
+    std::fs::create_dir(&external).unwrap();
+    let sentinel = external.join("sentinel");
+    std::fs::write(&sentinel, b"untouched").unwrap();
+    std::fs::remove_dir_all(repo_path.join("manifests")).unwrap();
+    symlink(&external, repo_path.join("manifests")).unwrap();
+
+    assert!(repo.apply_gc(&plan).is_err());
+    assert_eq!(std::fs::read(sentinel).unwrap(), b"untouched");
+    let cid = zerostun::ids::ContentId::parse(&ids[0]).unwrap();
+    assert!(repo.chunk_path(&cid).exists());
+}
+
+#[test]
+fn committed_recovery_refuses_chunk_that_became_live_after_crash() {
+    use zerostun::hash::root_hash_from_manifest;
+    use zerostun::manifest::{ChunkDescriptor, Manifest};
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let payload = b"became-live";
+    let cid = zerostun::hash::content_id_from_bytes(payload);
+    repo.write_chunk(&cid, CompressionCodec::None, payload)
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let trash = repo.root().join(&item.trash);
+    std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    std::fs::rename(repo.chunk_path(&cid), &trash).unwrap();
+    drop(repo);
+    insert_journal(
+        &repo_path,
+        &GcJournal {
+            plan,
+            phase: GcPhase::Committed,
+            moved: vec![cid.to_hex()],
+        },
+        GC_JOURNALS,
+    );
+    let repo = Repository::open(&repo_path).unwrap();
+    let mut manifest = Manifest::new("backup-new-live", payload.len() as u64, 64, 128, 256);
+    manifest.add_chunk(ChunkDescriptor {
+        index: 0,
+        logical_offset: 0,
+        original_length: payload.len() as u64,
+        stored_length: payload.len() as u64,
+        codec: CompressionCodec::None,
+        content_id: cid,
+    });
+    manifest.root_hash = root_hash_from_manifest(&manifest);
+    repo.commit_manifest(&manifest).unwrap();
+    drop(repo);
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    assert!(reopened.recover_gc().is_err());
+    assert!(trash.exists());
+    assert!(reopened.load_manifest("backup-new-live").is_ok());
+}
+
+#[test]
+fn reader_lease_refuses_atomic_gc_barrier() {
+    const GC_STATE: TableDefinition<&str, u8> = TableDefinition::new("gc_state");
+    let fixture = futures_lite_backup_fixture();
+    let repo_path = fixture.repo.root().to_path_buf();
+    let backup_id = fixture.backup_id.clone();
+    drop(fixture.repo);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut state = write.open_table(GC_STATE).unwrap();
+        state.insert("barrier", 1).unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    let repo = Repository::open(&repo_path).unwrap();
+
+    assert!(repo
+        .acquire_reader_lease(&backup_id)
+        .unwrap_err()
+        .to_string()
+        .contains("garbage collection"));
+    assert!(repo.active_reader_leases().unwrap().is_empty());
+}
+
+#[test]
+fn backup_ids_reject_surrounding_whitespace() {
+    assert!(zerostun::ids::validate_backup_id(" backup").is_err());
+    assert!(zerostun::ids::validate_backup_id("backup ").is_err());
+}
+
+#[test]
+fn manifest_encode_enforces_decode_chunk_bound() {
+    use zerostun::manifest::{ChunkDescriptor, Manifest, MAX_MANIFEST_CHUNKS};
+
+    let cid = zerostun::hash::content_id_from_bytes(b"bounded");
+    let descriptor = ChunkDescriptor {
+        index: 0,
+        logical_offset: 0,
+        original_length: 7,
+        stored_length: 7,
+        codec: CompressionCodec::None,
+        content_id: cid,
+    };
+    let mut manifest = Manifest::new("backup-bounded", 0, 64, 128, 256);
+    manifest.chunks = vec![descriptor; MAX_MANIFEST_CHUNKS + 1];
+
+    assert!(manifest.encode().is_err());
+}
+
+#[test]
+fn gc_rehashes_reclaim_chunk_payload_before_planning() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"payload-a");
+    repo.write_chunk(&cid, CompressionCodec::None, b"payload-a")
+        .unwrap();
+    let wrong = zerostun::codec::StoredChunk::encode(CompressionCodec::None, b"payload-b");
+    std::fs::write(repo.chunk_path(&cid), wrong).unwrap();
+
+    assert!(matches!(repo.plan_gc(), Err(Error::ChunkCorrupt { .. })));
+}
+
+#[test]
+fn legacy_journal_accepts_cumulative_moved_and_absent_tombstones() {
+    use serde_json::json;
+    use zerostun::GcJournal;
+
+    let moved = (0..129)
+        .map(|index| format!("{index:064x}"))
+        .collect::<Vec<_>>();
+    let bytes = serde_json::to_vec(&json!({
+        "plan": {
+            "gc_id": "gc-legacy",
+            "live_chunks": 0,
+            "reclaim_chunks": [],
+            "reclaim_bytes": 0
+        },
+        "phase": "Moving",
+        "moved": moved
+    }))
+    .unwrap();
+
+    assert_eq!(GcJournal::decode(&bytes).unwrap().moved.len(), 129);
+}
+
 #[test]
 fn gc_plan_and_journal_json_are_stable_and_bounded() {
     use zerostun::{GcJournal, GcPhase};
@@ -741,5 +929,5 @@ fn gc_plan_and_journal_json_are_stable_and_bounded() {
     };
     let bytes = journal.encode().unwrap();
     assert_eq!(GcJournal::decode(&bytes).unwrap(), journal);
-    assert!(GcJournal::decode(&vec![0; 17 * 1024 * 1024]).is_err());
+    assert!(GcJournal::decode(&vec![0; 257 * 1024 * 1024]).is_err());
 }

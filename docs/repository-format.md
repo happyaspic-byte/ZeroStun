@@ -106,11 +106,16 @@ repository-relative canonical `chunks/<aa>/<rest>` and `trash/<gc-id>/<aa>/<rest
 tombstone generation set, and current live-set before mutation. Both `apply_gc` and destructive
 `recover_gc` are caller-held writer-lock primitives; neither acquires a nested writer lock.
 
-The `gc_journals` redb table stores bounded JSON `GcJournal` DTOs. Each journal contains its
-`GcPlan`, phase, and the content IDs durably recorded as moved. Move progress is committed in
-batches of exactly 128, with a final short batch. Journal state is synced before filesystem
-moves and every phase transition. Chunk moves are same-filesystem renames; affected files and
-directories are synced after rename and deletion.
+The `gc_journals` redb table stores bounded JSON `GcJournal` DTOs. Each new journal persists
+its full plan once before `Moving`; filesystem source/trash state is authoritative during
+recovery, so new journals keep `moved` empty. Recovery still decodes legacy cumulative `moved`
+lists up to 1,000,000 entries and legacy plans without tombstone snapshots. Journal state is
+synced before filesystem moves and at the committed transition, avoiding repeated full-plan
+rewrites. The typed `gc_state` table holds a GC barrier. Barrier installation and the empty-lease
+check share one redb write transaction; reader visibility checks and lease insertion likewise
+share one write transaction. The barrier remains installed through destructive work and is
+removed atomically with the terminal journal. After same-filesystem rename, the destination
+directory is synced before the source directory.
 
 Phases have these crash semantics:
 
@@ -120,8 +125,17 @@ Phases have these crash semantics:
 - `Deleting`: recovery continues trash deletion, tombstone/index finalization, and manifest-copy removal.
 - `Complete`: terminal journal entries are removed; later recovery has no historical work to repeat.
 
-Recovery removes rolled-back and completed journals durably. It never overwrites an existing
-source or trash destination. Dual copies are corruption.
+Recovery reconstructs the current live set before any `Committed`/`Deleting` mutation and
+refuses to delete a CID that became live after the crash. It removes rolled-back and completed
+journals durably. It never overwrites an existing source or trash destination. Dual copies are
+corruption. GC validates repository roots and all `chunks`, prefix, `manifests`, and `trash`
+ancestors as confined real directories, then boundedly parses, decompresses, and rehashes every
+live, reclaim, and recovery source chunk. Live chunk codec and lengths must match manifest
+metadata.
+
+Directory durability is a Unix contract: directory `sync_all` is exercised on Unix. The
+non-Unix implementation is intentionally a no-op because portable directory fsync is not
+available through the Rust standard library.
 After `Committed`, authoritative `backups` and `tombstones` entries are removed consistently and
 the human-readable manifest copy is deleted, preventing undelete of a finalized backup. Chunks
 still referenced by any valid non-tombstoned manifest remain live.

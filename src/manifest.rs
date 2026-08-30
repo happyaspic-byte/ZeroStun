@@ -6,7 +6,7 @@ use crate::ids::{ContentId, RootHash};
 
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 pub const MANIFEST_MAGIC: &[u8; 8] = b"ZSTNMFST";
-pub const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_MANIFEST_BYTES: usize = 256 * 1024 * 1024;
 pub const MAX_MANIFEST_CHUNKS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,8 +60,22 @@ impl Manifest {
     }
 
     pub fn encode(&self) -> Result<Vec<u8>> {
+        if self.chunks.len() > MAX_MANIFEST_CHUNKS {
+            return Err(Error::ManifestCorrupt(
+                "manifest chunk count exceeds bounded maximum".to_string(),
+            ));
+        }
         let json = serde_json::to_vec(self)
             .map_err(|e| Error::ManifestCorrupt(format!("encode failed: {e}")))?;
+        if json
+            .len()
+            .checked_add(12)
+            .is_none_or(|len| len > MAX_MANIFEST_BYTES)
+        {
+            return Err(Error::ManifestCorrupt(
+                "manifest exceeds bounded maximum size".to_string(),
+            ));
+        }
         let mut out = Vec::with_capacity(12 + json.len());
         out.extend_from_slice(MANIFEST_MAGIC);
         out.extend_from_slice(&self.format_version.to_le_bytes());
