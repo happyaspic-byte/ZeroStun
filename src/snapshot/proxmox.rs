@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use super::http::validate_https_endpoint;
+use super::http::{prepare_http_request, validate_https_endpoint};
 use super::{
     ApiAuth, BoxFuture, HttpMethod, HttpRequest, HttpTransport, ProviderCapabilities,
     SnapshotHandle, SnapshotProvider, SnapshotRequest, PROVIDER_TIMEOUT,
@@ -74,6 +74,7 @@ impl<T: HttpTransport + Clone> ProxmoxProvider<T> {
         let token = self.config.load_token()?;
         let request = HttpRequest {
             method,
+            endpoint: self.config.endpoint.clone(),
             path,
             body,
             headers: vec![(
@@ -83,13 +84,15 @@ impl<T: HttpTransport + Clone> ProxmoxProvider<T> {
                     token_id = self.config.token_id
                 ),
             )],
-            secret_values: vec![token],
+            secret_values: vec![token.clone()],
         };
-        Ok(self
+        prepare_http_request(&request)?;
+        let body = self
             .transport
             .send(&request, PROVIDER_TIMEOUT, cancel)
             .await?
-            .body)
+            .body;
+        Ok(body)
     }
 
     fn node(&self) -> Result<&str> {
@@ -184,13 +187,15 @@ impl<T: HttpTransport + Clone + 'static> SnapshotProvider for ProxmoxProvider<T>
             self.probe_capabilities(cancel).await?;
             let id = new_managed_name()?;
             let body = format!("snapname={id}");
-            self.send(
-                HttpMethod::Post,
-                self.snapshot_collection()?,
-                Some(body),
-                cancel,
-            )
-            .await?;
+            let created = self
+                .send(
+                    HttpMethod::Post,
+                    self.snapshot_collection()?,
+                    Some(body),
+                    cancel,
+                )
+                .await?;
+            reject_async_upid(&created)?;
             Ok(SnapshotHandle {
                 source: self.expected_source(&id)?,
                 id,
@@ -291,7 +296,22 @@ struct SnapshotRow {
 
 fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
     serde_json::from_slice(bytes)
-        .map_err(|error| Error::Snapshot(format!("invalid {what} JSON response: {error}")))
+        .map_err(|_| Error::Snapshot(format!("invalid {what} JSON response")))
+}
+
+fn reject_async_upid(bytes: &[u8]) -> Result<()> {
+    let parsed: serde_json::Value = parse_json(bytes, "Proxmox snapshot create")?;
+    if parsed
+        .get("data")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| value.starts_with("UPID:"))
+    {
+        return Err(Error::Snapshot(
+            "Proxmox snapshot create returned an asynchronous UPID instead of a completed snapshot"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_vm_status(bytes: &[u8], vmid: u32) -> Result<()> {

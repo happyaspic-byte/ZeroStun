@@ -44,7 +44,7 @@ async fn proxmox_probe_create_open_cleanup_and_recover_use_exact_requests() {
         fixture("storage.json"),
         fixture("vm-status.json"),
         fixture("storage.json"),
-        b"{\"data\":\"UPID:pve:0000:zerostun\"}".to_vec(),
+        b"{\"data\":{\"name\":\"zerostun-created\"}}".to_vec(),
         b"{\"data\":{\"name\":\"zerostun-a1\"}}".to_vec(),
         b"{\"data\":{\"name\":\"zerostun-a1\"}}".to_vec(),
         b"".to_vec(),
@@ -93,11 +93,10 @@ async fn proxmox_probe_create_open_cleanup_and_recover_use_exact_requests() {
     assert_eq!(recorded[3].path, "/api2/json/nodes/pve/storage");
     assert_eq!(recorded[4].method, HttpMethod::Post);
     assert_eq!(recorded[4].path, "/api2/json/nodes/pve/qemu/100/snapshot");
-    assert!(recorded[4]
-        .body
-        .as_deref()
-        .unwrap()
-        .contains("snapname=zerostun-"));
+    let created_body = recorded[4].body.as_deref().unwrap();
+    assert!(created_body.starts_with("snapname=zerostun-"));
+    assert!(!created_body.contains('&'));
+    assert_eq!(recorded[4].endpoint, "https://pve.example:8006");
     assert_eq!(recorded[5].method, HttpMethod::Get);
     assert_eq!(
         recorded[5].path,
@@ -170,13 +169,32 @@ async fn proxmox_classifies_probe_create_open_cleanup_and_recover_failures() {
     assert!(provider.probe(&cancel).await.is_err());
 
     let provider = ProxmoxProvider::new(
-        FakeHttpTransport::scripted([FakeHttpScript::fail(500, b"create denied")]),
+        FakeHttpTransport::scripted([
+            FakeHttpScript::ok(fixture("vm-status.json")),
+            FakeHttpScript::ok(fixture("storage.json")),
+            FakeHttpScript::fail(500, b"create denied"),
+        ]),
         config(),
     );
     assert!(provider
         .create(&SnapshotRequest::new("100"), &cancel)
         .await
         .is_err());
+
+    let provider = ProxmoxProvider::new(
+        FakeHttpTransport::scripted([
+            fixture("vm-status.json"),
+            fixture("storage.json"),
+            b"{\"data\":\"UPID:pve:0000:zerostun\"}".to_vec(),
+        ]),
+        config(),
+    );
+    assert!(provider
+        .create(&SnapshotRequest::new("100"), &cancel)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("UPID"));
 
     let provider = ProxmoxProvider::new(FakeHttpTransport::failing(404, b"open denied"), config());
     assert!(provider.open_source(&handle(), &cancel).await.is_err());
@@ -215,6 +233,7 @@ async fn proxmox_timeout_cancel_and_redaction_are_enforced() {
         .send(
             &HttpRequest {
                 method: HttpMethod::Get,
+                endpoint: "https://pve.example:8006".into(),
                 path: "/probe".into(),
                 body: None,
                 headers: vec![(
@@ -255,6 +274,7 @@ async fn http_transport_rejects_unsafe_paths_and_oversized_responses() {
     let transport = FakeHttpTransport::scripted([b"unused".to_vec()]);
     let unsafe_request = HttpRequest {
         method: HttpMethod::Get,
+        endpoint: "https://pve.example:8006".into(),
         path: "https://attacker.example/probe".into(),
         body: None,
         headers: Vec::new(),
@@ -273,6 +293,7 @@ async fn http_transport_rejects_unsafe_paths_and_oversized_responses() {
     let oversized = FakeHttpTransport::scripted([vec![b'x'; MAX_HTTP_BODY_BYTES + 1]]);
     let request = HttpRequest {
         method: HttpMethod::Get,
+        endpoint: "https://pve.example:8006".into(),
         path: "/probe".into(),
         body: None,
         headers: Vec::new(),
@@ -284,6 +305,23 @@ async fn http_transport_rejects_unsafe_paths_and_oversized_responses() {
         .unwrap_err()
         .to_string()
         .contains("bounded"));
+
+    let scheme_relative = HttpRequest {
+        method: HttpMethod::Get,
+        endpoint: "https://pve.example:8006".into(),
+        path: "//attacker.example/probe".into(),
+        body: None,
+        headers: Vec::new(),
+        secret_values: Vec::new(),
+    };
+    assert!(transport
+        .send(
+            &scheme_relative,
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -303,6 +341,7 @@ async fn provider_configuration_and_token_placement_fail_closed() {
 
     let token_in_body = HttpRequest {
         method: HttpMethod::Post,
+        endpoint: "https://pve.example:8006".into(),
         path: "/probe".into(),
         body: Some("token=pve-secret-token".into()),
         headers: vec![(

@@ -111,6 +111,10 @@ async fn stratus_lifecycle_and_recovery_use_exact_requests() {
     let r = transport.recorded();
     assert_eq!(r[1].path, "/everrun/api/v1/workloads/workload-1/snapshots");
     assert_eq!(r[1].method, HttpMethod::Post);
+    let created_body = r[1].body.as_deref().unwrap();
+    assert!(created_body.starts_with(r#"{"name":"zerostun-"#));
+    assert!(created_body.ends_with(r#"","read_only":true}"#));
+    assert_eq!(r[1].endpoint, "https://ft.example");
     assert_eq!(r[3].method, HttpMethod::Get);
     assert_eq!(r[4].method, HttpMethod::Delete);
     assert_eq!(r[6].method, HttpMethod::Get);

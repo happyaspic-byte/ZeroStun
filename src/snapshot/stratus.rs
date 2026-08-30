@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 
-use super::http::validate_https_endpoint;
+use super::http::{prepare_http_request, validate_https_endpoint};
 use super::{
     ApiAuth, BoxFuture, HttpMethod, HttpRequest, HttpTransport, ProviderCapabilities,
     SnapshotHandle, SnapshotProvider, SnapshotRequest, PROVIDER_TIMEOUT,
@@ -59,16 +59,19 @@ impl<T: HttpTransport + Clone> StratusProvider<T> {
         let token = self.config.auth.load()?;
         let request = HttpRequest {
             method,
+            endpoint: self.config.endpoint.clone(),
             path,
             body,
             headers: vec![("Authorization".to_string(), format!("Bearer {token}"))],
-            secret_values: vec![token],
+            secret_values: vec![token.clone()],
         };
-        Ok(self
+        prepare_http_request(&request)?;
+        let body = self
             .transport
             .send(&request, PROVIDER_TIMEOUT, cancel)
             .await?
-            .body)
+            .body;
+        Ok(body)
     }
 
     fn root(&self) -> &'static str {
@@ -306,7 +309,7 @@ struct SnapshotList {
 
 fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T> {
     serde_json::from_slice(bytes)
-        .map_err(|error| Error::Snapshot(format!("invalid {what} JSON response: {error}")))
+        .map_err(|_| Error::Snapshot(format!("invalid {what} JSON response")))
 }
 
 fn parse_health(bytes: &[u8], kind: ApplianceKind) -> Result<Health> {

@@ -14,8 +14,8 @@ mod stratus;
 mod zfs;
 
 pub use http::{
-    ApiAuth, FakeHttpScript, FakeHttpTransport, HttpMethod, HttpRequest, HttpResponse,
-    HttpTransport, MAX_HTTP_BODY_BYTES,
+    redact_http_text, ApiAuth, FakeHttpScript, FakeHttpTransport, HttpMethod, HttpRequest,
+    HttpResponse, HttpTransport, MAX_HTTP_BODY_BYTES,
 };
 pub use lvm::LvmProvider;
 pub use proxmox::{ProxmoxConfig, ProxmoxProvider};

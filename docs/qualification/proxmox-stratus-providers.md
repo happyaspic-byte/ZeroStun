@@ -10,7 +10,9 @@ Verification level: `contract-tested`
 `SnapshotProvider` contract exclusively through `HttpTransport`. API transport
 is separated from snapshot lifecycle logic. No shell interpolation is used.
 Requests inherit the shared five-second timeout, cancellation, 32 KiB body
-bound, relative-path validation, and secret redaction.
+bound, HTTPS origin binding, relative-path validation, and secret redaction.
+Asynchronous Proxmox UPIDs fail closed instead of being treated as completed
+snapshots. No live HTTP client is included at this verification level.
 
 API tokens are loaded only from an environment variable or an explicit regular
 file whose Unix mode is exactly `0600`. Tokens are never accepted as literals or

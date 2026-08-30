@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
 use std::fmt;
-use std::fs;
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,6 +26,7 @@ pub enum HttpMethod {
 #[derive(Clone)]
 pub struct HttpRequest {
     pub method: HttpMethod,
+    pub endpoint: String,
     pub path: String,
     pub body: Option<String>,
     pub headers: Vec<(String, String)>,
@@ -35,6 +37,7 @@ impl fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HttpRequest")
             .field("method", &self.method)
+            .field("endpoint", &self.endpoint)
             .field("path", &redact_secrets(&self.secret_values, &self.path))
             .field(
                 "body",
@@ -122,8 +125,8 @@ impl FakeHttpTransport {
     pub fn recorded(&self) -> Vec<HttpRequest> {
         self.recorded
             .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default()
+            .expect("http transport lock poisoned")
+            .clone()
     }
 }
 
@@ -138,9 +141,7 @@ impl HttpTransport for FakeHttpTransport {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
-            validate_request_path(&request.path)?;
-            reject_secrets_in_body(request)?;
-            reject_secrets_in_path(request)?;
+            prepare_http_request(request)?;
 
             {
                 let mut recorded = self
@@ -207,7 +208,7 @@ impl ApiAuth {
                             .to_string(),
                     )
                 })?;
-                require_token(value.trim())
+                require_token(&value)
             }
         }
     }
@@ -223,7 +224,18 @@ impl fmt::Debug for ApiAuth {
 }
 
 fn load_token_file(path: &std::path::Path) -> Result<String> {
-    let metadata = fs::symlink_metadata(path)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(0o400000)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(40) || error.raw_os_error() == Some(95) {
+                Error::Snapshot("API token file must not be a symlink".to_string())
+            } else {
+                Error::from(error)
+            }
+        })?;
+    let metadata = file.metadata()?;
     if metadata.file_type().is_symlink() {
         return Err(Error::Snapshot(
             "API token file must not be a symlink".to_string(),
@@ -245,13 +257,30 @@ fn load_token_file(path: &std::path::Path) -> Result<String> {
             "API token file exceeds the 4 KiB maximum".to_string(),
         ));
     }
-    let token = fs::read_to_string(path)?;
-    if token.contains('\0') {
+    let mut token = Vec::new();
+    file.read_to_end(&mut token)?;
+    if token.len() as u64 > MAX_TOKEN_BYTES {
         return Err(Error::Snapshot(
-            "API token must not contain a NUL byte".to_string(),
+            "API token file exceeds the 4 KiB maximum".to_string(),
         ));
     }
-    require_token(token.trim())
+    require_token_bytes(&token)
+}
+
+pub(crate) fn prepare_http_request(request: &HttpRequest) -> Result<()> {
+    validate_https_endpoint(&request.endpoint, "HTTP")?;
+    validate_request_path(&request.path)?;
+    reject_secrets_in_body(request)?;
+    reject_secrets_in_path(request)?;
+    for (name, value) in &request.headers {
+        validate_header_name(name)?;
+        if name.eq_ignore_ascii_case("authorization") {
+            validate_authorization_value(value)?;
+        } else {
+            validate_header_value(value)?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_https_endpoint(endpoint: &str, what: &str) -> Result<()> {
@@ -268,8 +297,10 @@ pub(crate) fn validate_https_endpoint(endpoint: &str, what: &str) -> Result<()> 
         || remainder.contains("://")
         || remainder.contains('/')
         || remainder.contains('?')
+        || remainder.contains(' ')
+        || remainder.starts_with(':')
         || remainder.contains(':') && remainder.matches(':').count() > 1
-        || remainder.bytes().any(|byte| byte < 0x20)
+        || remainder.bytes().any(|byte| byte <= 0x20)
     {
         return Err(Error::Snapshot(format!(
             "{what} endpoint must be an https origin without userinfo or fragment"
@@ -309,13 +340,18 @@ fn reject_secrets_in_body(request: &HttpRequest) -> Result<()> {
 
 fn validate_request_path(path: &str) -> Result<()> {
     if !path.starts_with('/')
+        || path.starts_with("//")
         || path.contains("://")
         || path.contains('\\')
         || path.contains('\0')
+        || path.contains('?')
+        || path.contains('#')
+        || path.contains('%')
         || path.bytes().any(|byte| byte < 0x20)
         || path
             .split('/')
-            .any(|component| component == "." || component == "..")
+            .skip(1)
+            .any(|component| component.is_empty() || component == "." || component == "..")
     {
         return Err(Error::Snapshot(
             "HTTP request path must be a relative origin-free path".to_string(),
@@ -324,13 +360,62 @@ fn validate_request_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+fn require_token_bytes(bytes: &[u8]) -> Result<String> {
+    let token = std::str::from_utf8(bytes)
+        .map_err(|_| Error::Snapshot("API token must be UTF-8".to_string()))?;
+    require_token(token)
+}
+
 fn require_token(token: &str) -> Result<String> {
+    let token = token.trim_end_matches(['\n', '\r']);
     if token.is_empty() {
         return Err(Error::Snapshot(
             "API token is missing; use an environment value or a mode-0600 file".to_string(),
         ));
     }
+    if token.bytes().any(|byte| byte < 0x20 || byte == b'\x7f') {
+        return Err(Error::Snapshot(
+            "API token contains unsafe header characters".to_string(),
+        ));
+    }
     Ok(token.to_string())
+}
+
+fn validate_header_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(Error::Snapshot(
+            "HTTP header name contains unsafe characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_header_value(value: &str) -> Result<()> {
+    if value.bytes().any(|byte| byte < 0x20 || byte == b'\x7f') {
+        return Err(Error::Snapshot(
+            "HTTP header value contains unsafe characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authorization_value(value: &str) -> Result<()> {
+    validate_header_value(value)?;
+    if value.contains(' ') {
+        let (scheme, credential) = value.split_once(' ').ok_or_else(|| {
+            Error::Snapshot("Authorization header is missing a credential".to_string())
+        })?;
+        if scheme.is_empty() || credential.is_empty() || credential.contains(' ') {
+            return Err(Error::Snapshot(
+                "Authorization header is not a single credential".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn finish_http(request: &HttpRequest, status: u16, body: Vec<u8>) -> Result<HttpResponse> {
@@ -356,6 +441,10 @@ fn bounded_lossy(bytes: &[u8]) -> String {
         bytes
     };
     String::from_utf8_lossy(slice).into_owned()
+}
+
+pub fn redact_http_text(text: &str, secrets: &[String]) -> String {
+    redact_secrets(secrets, text)
 }
 
 fn redact_secrets(secrets: &[String], text: &str) -> String {
@@ -385,6 +474,7 @@ fn redacted_headers(request: &HttpRequest) -> Vec<(String, String)> {
 fn redacted_request(request: &HttpRequest) -> HttpRequest {
     HttpRequest {
         method: request.method,
+        endpoint: request.endpoint.clone(),
         path: redact_secrets(&request.secret_values, &request.path),
         body: request
             .body
