@@ -6,14 +6,18 @@ use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
 
+mod lvm;
 mod runner;
+mod zfs;
 
+pub use lvm::LvmProvider;
 pub use runner::{
     redact_text, BoxFuture, CommandOutput, CommandRunner, CommandSpec, FakeRunner,
     FakeRunnerScript, ProcessRunner, RecordedCommand, MAX_COMMAND_OUTPUT_BYTES,
 };
+pub use zfs::{ZfsProvider, ZfsTargetCapabilities, ZfsTargetKind};
 
-const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
 const PROVIDER_PROGRAM: &str = "/usr/bin/zst-probe";
 const PROVIDER_TARGET: &str = "volume-a";
 
@@ -26,13 +30,43 @@ pub struct SnapshotHandle {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRequest {
     pub target: String,
+    #[serde(default)]
+    require_quiesce: bool,
+    #[serde(default)]
+    require_changed_block: bool,
 }
 
 impl SnapshotRequest {
     pub fn new(target: impl Into<String>) -> Self {
         Self {
             target: target.into(),
+            require_quiesce: false,
+            require_changed_block: false,
         }
+    }
+
+    pub fn require_quiesce(mut self) -> Self {
+        self.require_quiesce = true;
+        self
+    }
+
+    pub fn require_changed_block(mut self) -> Self {
+        self.require_changed_block = true;
+        self
+    }
+
+    pub(crate) fn validate_requirements(&self, capabilities: ProviderCapabilities) -> Result<()> {
+        if self.require_quiesce && !capabilities.quiesce {
+            return Err(Error::Snapshot(
+                "snapshot provider does not support requested quiesce semantics".to_string(),
+            ));
+        }
+        if self.require_changed_block && !capabilities.changed_block {
+            return Err(Error::Snapshot(
+                "snapshot provider does not support requested changed-block semantics".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn validated_target(&self) -> Result<&str> {

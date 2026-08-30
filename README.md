@@ -24,10 +24,26 @@ so backups can be verified and restored byte-for-byte.
 - Crash-consistent snapshots of live files
 - Encryption, signatures, or remote authentication
 - Network replication, S3, or regulatory WORM enforcement
-- Proxmox, everRun, ztC, LVM, or ZFS integration
+- Proxmox, everRun, or ztC integration
 
 Rate limits bound backup I/O. They are not a proof that another process on the
 same host will never stall. See `docs/zero-stun-contract.md`.
+
+## Snapshot provider support
+
+| Provider | Source semantics | Verification level | Notes |
+| --- | --- | --- | --- |
+| LVM | Read-only logical-volume snapshot at a stable `/dev/mapper` path | `contract-tested` | Exact-argv `lvs`/`lvcreate`/`lvremove`, tagged stale-snapshot recovery; no disposable root storage lab was available |
+| ZFS filesystem | Read-only clone mounted under `/run/zerostun/zfs` | `contract-tested` | Snapshot, clone, mount, reverse cleanup, and stale-resource recovery are fault-injected |
+| ZFS ZVOL | Read-only clone exposed under `/dev/zvol` | `contract-tested` | Block-device lifecycle is separated from filesystem mount semantics |
+| Proxmox | Not implemented | unsupported | Planned production provider |
+| everRun / ztC | Not implemented | unsupported | Planned hardware providers |
+
+`contract-tested` means provider commands, parsing, failures, timeout,
+cancellation, redaction, validation, and recovery are verified against a fake
+exact-argv runner. It does not claim integration or hardware verification.
+This host had non-root LVM tooling and no ZFS binary, so only non-destructive
+availability probes were run; no host storage was modified.
 
 ## Build
 
