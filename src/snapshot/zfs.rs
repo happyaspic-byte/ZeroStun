@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 const ZFS: &str = "/usr/sbin/zfs";
 const SNAPSHOT_PREFIX: &str = "zerostun-";
 const FS_MOUNT_ROOT: &str = "/run/zerostun/zfs";
+const MANAGED_PROPERTY: &str = "org.zerostun:managed=on";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZfsTargetKind {
@@ -97,7 +98,7 @@ impl<R: CommandRunner + Clone> ZfsProvider<R> {
             .arg("-H")
             .arg("-p")
             .arg("-o")
-            .arg("name,type,mounted,origin")
+            .arg("name,type,mounted,mountpoint,readonly,org.zerostun:managed,origin")
             .arg("-t")
             .arg("filesystem,volume");
         if let Some(target) = target {
@@ -116,7 +117,7 @@ impl<R: CommandRunner + Clone> ZfsProvider<R> {
                     .arg("-H")
                     .arg("-p")
                     .arg("-o")
-                    .arg("name")
+                    .arg("name,org.zerostun:managed")
                     .arg("-t")
                     .arg("snapshot"),
                 PROVIDER_TIMEOUT,
@@ -150,6 +151,28 @@ impl<R: CommandRunner + Clone> ZfsProvider<R> {
         self.run(CommandSpec::new(ZFS).arg("destroy").arg(snapshot), cancel)
             .await
     }
+
+    async fn require_managed_clone(
+        &self,
+        name: &str,
+        origin: &str,
+        cancel: &CancellationToken,
+    ) -> Result<CloneRow> {
+        let rows = self.list_clones(Some(name), cancel).await?;
+        let matching: Vec<CloneRow> = rows
+            .into_iter()
+            .filter(|clone| clone.name == name && clone.origin == origin)
+            .collect();
+        if matching.len() != 1 {
+            return Err(Error::Snapshot(format!(
+                "managed ZFS clone was not found: {name}"
+            )));
+        }
+        matching
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Snapshot(format!("managed ZFS clone was not found: {name}")))
+    }
 }
 
 impl<R: CommandRunner + Clone + 'static> SnapshotProvider for ZfsProvider<R> {
@@ -181,28 +204,64 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for ZfsProvider<R> {
             let clone = clone_name(&snapshot)?;
             let source = source_path(&snapshot, row.kind)?;
 
-            self.run(CommandSpec::new(ZFS).arg("snapshot").arg(&snapshot), cancel)
+            let created = async {
+                self.run(
+                    CommandSpec::new(ZFS)
+                        .arg("snapshot")
+                        .arg("-o")
+                        .arg(MANAGED_PROPERTY)
+                        .arg(&snapshot),
+                    cancel,
+                )
                 .await?;
-            let clone_spec = match row.kind {
-                ZfsTargetKind::Filesystem => CommandSpec::new(ZFS)
-                    .arg("clone")
-                    .arg("-o")
-                    .arg("readonly=on")
-                    .arg("-o")
-                    .arg(format!("mountpoint={}", source.display()))
-                    .arg(&snapshot)
-                    .arg(&clone),
-                ZfsTargetKind::Volume => CommandSpec::new(ZFS)
-                    .arg("clone")
-                    .arg("-o")
-                    .arg("readonly=on")
-                    .arg(&snapshot)
-                    .arg(&clone),
-            };
-            self.run(clone_spec, cancel).await?;
-            if row.kind == ZfsTargetKind::Filesystem {
-                self.run(CommandSpec::new(ZFS).arg("mount").arg(&clone), cancel)
-                    .await?;
+                let clone_spec = match row.kind {
+                    ZfsTargetKind::Filesystem => CommandSpec::new(ZFS)
+                        .arg("clone")
+                        .arg("-o")
+                        .arg(MANAGED_PROPERTY)
+                        .arg("-o")
+                        .arg("readonly=on")
+                        .arg("-o")
+                        .arg("canmount=noauto")
+                        .arg("-o")
+                        .arg(format!("mountpoint={}", source.display()))
+                        .arg(&snapshot)
+                        .arg(&clone),
+                    ZfsTargetKind::Volume => CommandSpec::new(ZFS)
+                        .arg("clone")
+                        .arg("-o")
+                        .arg(MANAGED_PROPERTY)
+                        .arg("-o")
+                        .arg("readonly=on")
+                        .arg(&snapshot)
+                        .arg(&clone),
+                };
+                self.run(clone_spec, cancel).await?;
+                if row.kind == ZfsTargetKind::Filesystem {
+                    self.run(CommandSpec::new(ZFS).arg("mount").arg(&clone), cancel)
+                        .await?;
+                }
+                Ok::<(), Error>(())
+            }
+            .await;
+            if created.is_err() {
+                let cleanup_cancel = CancellationToken::new();
+                if let Ok(managed) = self
+                    .require_managed_clone(&clone, &snapshot, &cleanup_cancel)
+                    .await
+                {
+                    let _ = self
+                        .remove_clone(&clone, managed.kind, managed.mounted, &cleanup_cancel)
+                        .await;
+                }
+                if self
+                    .list_snapshots(&cleanup_cancel)
+                    .await
+                    .is_ok_and(|snapshots| snapshots.iter().any(|name| name == &snapshot))
+                {
+                    let _ = self.destroy_snapshot(&snapshot, &cleanup_cancel).await;
+                }
+                created?;
             }
 
             Ok(SnapshotHandle {
@@ -219,25 +278,17 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for ZfsProvider<R> {
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
             let expected_kind = validate_handle(handle)?;
+            let expected_source = source_path(&handle.id, expected_kind)?;
+            if handle.source != expected_source {
+                return Err(Error::Snapshot(
+                    "ZFS snapshot handle source does not match its derived source path".to_string(),
+                ));
+            }
             let clone_name = clone_name(&handle.id)?;
-            let clones = self.list_clones(Some(&clone_name), cancel).await?;
-            let clone = clones
-                .iter()
-                .find(|clone| clone.name == clone_name && clone.origin == handle.id)
-                .ok_or_else(|| {
-                    Error::Snapshot(format!("managed ZFS clone was not found: {clone_name}"))
-                })?;
-            if clone.kind != expected_kind {
-                return Err(Error::Snapshot(
-                    "ZFS clone type does not match the snapshot handle source semantics"
-                        .to_string(),
-                ));
-            }
-            if clone.kind == ZfsTargetKind::Filesystem && !clone.mounted {
-                return Err(Error::Snapshot(
-                    "managed ZFS filesystem clone is not mounted".to_string(),
-                ));
-            }
+            let clone = self
+                .require_managed_clone(&clone_name, &handle.id, cancel)
+                .await?;
+            verify_clone_source(&clone, expected_kind, &expected_source)?;
             Ok(handle.source.clone())
         })
     }
@@ -249,22 +300,17 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for ZfsProvider<R> {
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let expected_kind = validate_handle(handle)?;
-            let clone_name = clone_name(&handle.id)?;
-            let clones = self.list_clones(Some(&clone_name), cancel).await?;
-            let clone = clones
-                .iter()
-                .find(|clone| clone.name == clone_name && clone.origin == handle.id)
-                .ok_or_else(|| {
-                    Error::Snapshot(
-                        "refusing cleanup because the managed ZFS clone was not verified"
-                            .to_string(),
-                    )
-                })?;
-            if clone.kind != expected_kind {
+            let expected_source = source_path(&handle.id, expected_kind)?;
+            if handle.source != expected_source {
                 return Err(Error::Snapshot(
-                    "refusing cleanup because ZFS clone type does not match the handle".to_string(),
+                    "ZFS snapshot handle source does not match its derived source path".to_string(),
                 ));
             }
+            let clone_name = clone_name(&handle.id)?;
+            let clone = self
+                .require_managed_clone(&clone_name, &handle.id, cancel)
+                .await?;
+            verify_clone_source(&clone, expected_kind, &expected_source)?;
             self.remove_clone(&clone.name, clone.kind, clone.mounted, cancel)
                 .await?;
             self.destroy_snapshot(&handle.id, cancel).await
@@ -324,6 +370,8 @@ struct CloneRow {
     name: String,
     kind: ZfsTargetKind,
     mounted: bool,
+    mountpoint: Option<PathBuf>,
+    read_only: bool,
     origin: String,
 }
 
@@ -365,18 +413,23 @@ fn parse_clones(bytes: &[u8]) -> Result<Vec<CloneRow>> {
     parse_utf8_lines(bytes)?
         .filter_map(|line| {
             let fields: Vec<&str> = line.split('\t').collect();
-            if fields.len() != 4 {
+            if fields.len() != 7 {
                 return Some(Err(Error::Snapshot(
                     "invalid ZFS clone machine output".to_string(),
                 )));
             }
-            if fields[3] == "-" || !fields[3].contains(&format!("@{SNAPSHOT_PREFIX}")) {
+            if fields[5] != "on" {
                 return None;
+            }
+            if fields[6] == "-" || !fields[6].contains(&format!("@{SNAPSHOT_PREFIX}")) {
+                return Some(Err(Error::Snapshot(
+                    "managed ZFS clone has an invalid origin".to_string(),
+                )));
             }
             Some((|| {
                 validate_zfs_dataset(fields[0])?;
-                validate_snapshot_id(fields[3])?;
-                if clone_name(fields[3])? != fields[0] {
+                validate_snapshot_id(fields[6])?;
+                if clone_name(fields[6])? != fields[0] {
                     return Err(Error::Snapshot(
                         "managed ZFS clone name does not match its origin".to_string(),
                     ));
@@ -391,16 +444,38 @@ fn parse_clones(bytes: &[u8]) -> Result<Vec<CloneRow>> {
                         )))
                     }
                 };
-                if kind == ZfsTargetKind::Volume && mounted {
-                    return Err(Error::Snapshot(
-                        "ZFS volume clone unexpectedly reports a mounted filesystem".to_string(),
-                    ));
-                }
+                let mountpoint = match fields[3] {
+                    "-" | "none" | "legacy" => None,
+                    value => {
+                        let path = PathBuf::from(value);
+                        if !path.is_absolute()
+                            || path.components().any(|component| {
+                                matches!(component, std::path::Component::ParentDir)
+                            })
+                        {
+                            return Err(Error::Snapshot(
+                                "managed ZFS clone has an unsafe mountpoint".to_string(),
+                            ));
+                        }
+                        Some(path)
+                    }
+                };
+                let read_only = match fields[4] {
+                    "on" => true,
+                    "off" => false,
+                    value => {
+                        return Err(Error::Snapshot(format!(
+                            "invalid ZFS readonly state in machine output: {value}"
+                        )))
+                    }
+                };
                 Ok(CloneRow {
                     name: fields[0].to_string(),
                     kind,
                     mounted,
-                    origin: fields[3].to_string(),
+                    mountpoint,
+                    read_only,
+                    origin: fields[6].to_string(),
                 })
             })())
         })
@@ -409,10 +484,20 @@ fn parse_clones(bytes: &[u8]) -> Result<Vec<CloneRow>> {
 
 fn parse_snapshot_names(bytes: &[u8]) -> Result<Vec<String>> {
     parse_utf8_lines(bytes)?
-        .filter(|line| line.contains(&format!("@{SNAPSHOT_PREFIX}")))
-        .map(|line| {
-            validate_snapshot_id(line)?;
-            Ok(line.to_string())
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() != 2 {
+                return Some(Err(Error::Snapshot(
+                    "invalid ZFS snapshot machine output".to_string(),
+                )));
+            }
+            if fields[1] != "on" {
+                return None;
+            }
+            Some((|| {
+                validate_snapshot_id(fields[0])?;
+                Ok(fields[0].to_string())
+            })())
         })
         .collect()
 }
@@ -475,6 +560,45 @@ fn source_path(snapshot: &str, kind: ZfsTargetKind) -> Result<PathBuf> {
         ))),
         ZfsTargetKind::Volume => Ok(PathBuf::from(format!("/dev/zvol/{clone}"))),
     }
+}
+
+fn verify_clone_source(
+    clone: &CloneRow,
+    expected_kind: ZfsTargetKind,
+    expected_source: &std::path::Path,
+) -> Result<()> {
+    if clone.kind != expected_kind {
+        return Err(Error::Snapshot(
+            "ZFS clone type does not match the snapshot handle source semantics".to_string(),
+        ));
+    }
+    if !clone.read_only {
+        return Err(Error::Snapshot(
+            "managed ZFS clone is not read-only".to_string(),
+        ));
+    }
+    match expected_kind {
+        ZfsTargetKind::Filesystem => {
+            if !clone.mounted {
+                return Err(Error::Snapshot(
+                    "managed ZFS filesystem clone is not mounted".to_string(),
+                ));
+            }
+            if clone.mountpoint.as_deref() != Some(expected_source) {
+                return Err(Error::Snapshot(
+                    "managed ZFS filesystem clone mountpoint does not match the handle".to_string(),
+                ));
+            }
+        }
+        ZfsTargetKind::Volume => {
+            if clone.mounted || clone.mountpoint.is_some() {
+                return Err(Error::Snapshot(
+                    "ZFS volume clone unexpectedly has filesystem mount semantics".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_handle(handle: &SnapshotHandle) -> Result<ZfsTargetKind> {

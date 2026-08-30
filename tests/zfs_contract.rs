@@ -9,8 +9,8 @@ use zerostun::snapshot::{
 
 const FS_PROBE: &[u8] = b"tank/data\tfilesystem\t/tank/data\n";
 const ZVOL_PROBE: &[u8] = b"tank/vol\tvolume\t-\n";
-const FS_CLONE: &[u8] = b"tank/zerostun-a1\tfilesystem\tyes\ttank/data@zerostun-a1\n";
-const ZVOL_CLONE: &[u8] = b"tank/zerostun-b2\tvolume\t-\ttank/vol@zerostun-b2\n";
+const FS_CLONE: &[u8] = b"tank/zerostun-a1\tfilesystem\tyes\t/run/zerostun/zfs/tank_data_zerostun-a1\ton\ton\ttank/data@zerostun-a1\n";
+const ZVOL_CLONE: &[u8] = b"tank/zerostun-b2\tvolume\t-\t-\ton\ton\ttank/vol@zerostun-b2\n";
 
 fn fs_handle() -> SnapshotHandle {
     SnapshotHandle {
@@ -73,13 +73,25 @@ async fn zfs_filesystem_lifecycle_uses_exact_argv_and_reverse_cleanup() {
             "tank/data"
         ]
     );
-    assert_eq!(c[1].args, vec!["snapshot", created.id.as_str()]);
+    assert_eq!(
+        c[1].args,
+        vec![
+            "snapshot",
+            "-o",
+            "org.zerostun:managed=on",
+            created.id.as_str()
+        ]
+    );
     assert_eq!(
         c[2].args,
         vec![
             "clone",
             "-o",
+            "org.zerostun:managed=on",
+            "-o",
             "readonly=on",
+            "-o",
+            "canmount=noauto",
             "-o",
             format!("mountpoint={}", created.source.display()).as_str(),
             created.id.as_str(),
@@ -125,7 +137,8 @@ async fn zfs_zvol_lifecycle_exposes_read_only_clone_device_without_mount() {
 
     let c = runner.recorded();
     assert_eq!(c[1].args[0], "snapshot");
-    assert_eq!(c[2].args[0], "clone");
+    assert!(c[2].args[0] == "clone");
+    assert!(c[2].args.iter().any(|arg| arg == "org.zerostun:managed=on"));
     assert!(!c.iter().any(|cmd| matches!(
         cmd.args.first().map(String::as_str),
         Some("mount" | "unmount")
@@ -155,9 +168,9 @@ async fn zfs_probe_distinguishes_filesystem_and_zvol_capabilities() {
 
 #[tokio::test]
 async fn zfs_recovery_removes_managed_clones_then_snapshots_in_reverse_order() {
-    let clones = b"tank/zerostun-old1\tfilesystem\tyes\ttank/data@zerostun-old1\n\
-                   tank/zerostun-old2\tvolume\t-\ttank/vol@zerostun-old2\n";
-    let snapshots = b"tank/data@zerostun-old1\ntank/vol@zerostun-old2\ntank/orphan@zerostun-old3\n";
+    let clones = b"tank/zerostun-old1\tfilesystem\tyes\t/run/zerostun/zfs/tank_data_zerostun-old1\ton\ton\ttank/data@zerostun-old1\n\
+                   tank/zerostun-old2\tvolume\t-\t-\ton\ton\ttank/vol@zerostun-old2\n";
+    let snapshots = b"tank/data@zerostun-old1\ton\ntank/vol@zerostun-old2\ton\ntank/orphan@zerostun-old3\ton\ntank/user@zerostun-keep\t-\n";
     let runner = FakeRunner::scripted([
         FakeRunnerScript::ok(clones),
         FakeRunnerScript::ok(snapshots),

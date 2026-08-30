@@ -41,7 +41,7 @@ impl<R: CommandRunner + Clone> LvmProvider<R> {
             .arg("--reportformat")
             .arg("json")
             .arg("--options")
-            .arg("vg_name,lv_name,lv_tags");
+            .arg("vg_name,lv_name,lv_tags,lv_attr");
         if let Some(target) = target {
             spec = spec.arg(target);
         }
@@ -58,6 +58,36 @@ impl<R: CommandRunner + Clone> LvmProvider<R> {
             )
             .await?;
         Ok(())
+    }
+
+    async fn require_managed_snapshot(
+        &self,
+        id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<LvRow> {
+        validate_managed_id(id)?;
+        let rows = self.list(Some(id), cancel).await?;
+        let matching: Vec<LvRow> = rows.into_iter().filter(|row| row.id() == id).collect();
+        if matching.len() != 1 {
+            return Err(Error::Snapshot(format!(
+                "managed LVM snapshot was not found: {id}"
+            )));
+        }
+        let row = matching
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Snapshot(format!("managed LVM snapshot was not found: {id}")))?;
+        if !row.is_managed() {
+            return Err(Error::Snapshot(
+                "refusing to use an LVM volume not tagged as ZeroStun-managed".to_string(),
+            ));
+        }
+        if !row.is_read_only_snapshot() {
+            return Err(Error::Snapshot(
+                "LVM snapshot is not a verified read-only snapshot".to_string(),
+            ));
+        }
+        Ok(row)
     }
 }
 
@@ -90,7 +120,8 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for LvmProvider<R> {
 
             let name = new_managed_name()?;
             let id = format!("{vg}/{name}");
-            self.runner
+            let created = self
+                .runner
                 .run(
                     &CommandSpec::new(LVCREATE)
                         .arg("--snapshot")
@@ -106,7 +137,18 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for LvmProvider<R> {
                     PROVIDER_TIMEOUT,
                     cancel,
                 )
-                .await?;
+                .await;
+            if created.is_err() {
+                let cleanup_cancel = CancellationToken::new();
+                if self
+                    .require_managed_snapshot(&id, &cleanup_cancel)
+                    .await
+                    .is_ok()
+                {
+                    let _ = self.remove(&id, &cleanup_cancel).await;
+                }
+                created?;
+            }
 
             Ok(SnapshotHandle {
                 source: mapper_path(&id)?,
@@ -121,20 +163,13 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for LvmProvider<R> {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<PathBuf>> {
         Box::pin(async move {
-            validate_managed_id(&handle.id)?;
             let expected = mapper_path(&handle.id)?;
             if handle.source != expected {
                 return Err(Error::Snapshot(
                     "LVM snapshot handle source does not match its stable mapper path".to_string(),
                 ));
             }
-            let rows = self.list(Some(&handle.id), cancel).await?;
-            if !rows.iter().any(LvRow::is_managed) {
-                return Err(Error::Snapshot(format!(
-                    "managed LVM snapshot was not found: {}",
-                    handle.id
-                )));
-            }
+            self.require_managed_snapshot(&handle.id, cancel).await?;
             Ok(expected)
         })
     }
@@ -145,18 +180,12 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for LvmProvider<R> {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            validate_managed_id(&handle.id)?;
             if handle.source != mapper_path(&handle.id)? {
                 return Err(Error::Snapshot(
                     "LVM snapshot handle source does not match its stable mapper path".to_string(),
                 ));
             }
-            let rows = self.list(Some(&handle.id), cancel).await?;
-            if !rows.iter().any(LvRow::is_managed) {
-                return Err(Error::Snapshot(
-                    "refusing to remove an LVM volume not tagged as ZeroStun-managed".to_string(),
-                ));
-            }
+            self.require_managed_snapshot(&handle.id, cancel).await?;
             self.remove(&handle.id, cancel).await
         })
     }
@@ -167,7 +196,7 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for LvmProvider<R> {
                 .list(None, cancel)
                 .await?
                 .into_iter()
-                .filter(LvRow::is_managed)
+                .filter(|row| row.is_managed() && row.is_read_only_snapshot())
                 .map(|row| row.id())
                 .collect();
             ids.sort();
@@ -211,6 +240,8 @@ struct LvRow {
     lv_name: String,
     #[serde(default)]
     lv_tags: String,
+    #[serde(default)]
+    lv_attr: String,
 }
 
 impl LvRow {
@@ -223,6 +254,11 @@ impl LvRow {
             && self.lv_tags.split(',').any(|tag| tag == MANAGED_TAG)
             && validate_component(&self.vg_name).is_ok()
             && validate_component(&self.lv_name).is_ok()
+    }
+
+    fn is_read_only_snapshot(&self) -> bool {
+        let attr = self.lv_attr.as_bytes();
+        attr.first().copied() == Some(b's') && attr.get(1).copied() == Some(b'r')
     }
 }
 

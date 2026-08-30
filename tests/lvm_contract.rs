@@ -8,9 +8,8 @@ use zerostun::snapshot::{
 };
 
 const EMPTY_LVS: &[u8] = br#"{"report":[{"lv":[]}]}"#;
-const ORIGIN_LVS: &[u8] =
-    br#"{"report":[{"lv":[{"vg_name":"vg-main","lv_name":"data","lv_tags":""}]}]}"#;
-const MANAGED_LVS: &[u8] = br#"{"report":[{"lv":[{"vg_name":"vg-main","lv_name":"zerostun-a1","lv_tags":"zerostun.snapshot"}]}]}"#;
+const ORIGIN_LVS: &[u8] = br#"{"report":[{"lv":[{"vg_name":"vg-main","lv_name":"data","lv_tags":"","lv_attr":"-wi-a-----"}]}]}"#;
+const MANAGED_LVS: &[u8] = br#"{"report":[{"lv":[{"vg_name":"vg-main","lv_name":"zerostun-a1","lv_tags":"zerostun.snapshot","lv_attr":"sri-a-s---"}]}]}"#;
 
 fn request() -> SnapshotRequest {
     SnapshotRequest::new("vg-main/data")
@@ -26,8 +25,8 @@ fn handle() -> SnapshotHandle {
 #[tokio::test]
 async fn lvm_probe_create_open_cleanup_and_recover_use_exact_argv() {
     let stale = br#"{"report":[{"lv":[
-        {"vg_name":"vg-main","lv_name":"zerostun-old1","lv_tags":"zerostun.snapshot"},
-        {"vg_name":"vg-main","lv_name":"zerostun-old2","lv_tags":"zerostun.snapshot"}
+        {"vg_name":"vg-main","lv_name":"zerostun-old1","lv_tags":"zerostun.snapshot","lv_attr":"sri-a-s---"},
+        {"vg_name":"vg-main","lv_name":"zerostun-old2","lv_tags":"zerostun.snapshot","lv_attr":"sri-a-s---"}
     ]}]}"#;
     let runner = FakeRunner::scripted([
         FakeRunnerScript::ok(EMPTY_LVS),
@@ -74,7 +73,7 @@ async fn lvm_probe_create_open_cleanup_and_recover_use_exact_argv() {
             "--reportformat",
             "json",
             "--options",
-            "vg_name,lv_name,lv_tags"
+            "vg_name,lv_name,lv_tags,lv_attr"
         ]
     );
     assert_eq!(commands[1].args.last().unwrap(), "vg-main/data");
@@ -207,6 +206,46 @@ async fn lvm_timeout_cancel_and_redaction_are_enforced_by_the_runner() {
 }
 
 #[tokio::test]
+async fn lvm_cleanup_requires_the_target_row_to_be_managed_and_read_only() {
+    let unrelated_managed = br#"{"report":[{"lv":[
+        {"vg_name":"vg-main","lv_name":"zerostun-other","lv_tags":"zerostun.snapshot","lv_attr":"sri-a-s---"}
+    ]}]}"#;
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(unrelated_managed)]);
+    let provider = LvmProvider::new(runner.clone());
+    let error = provider
+        .cleanup(&handle(), &CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("was not found"));
+    assert!(runner.recorded().len() == 1);
+
+    let writable = br#"{"report":[{"lv":[
+        {"vg_name":"vg-main","lv_name":"zerostun-a1","lv_tags":"zerostun.snapshot","lv_attr":"swi-a-s---"}
+    ]}]}"#;
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(writable)]);
+    let provider = LvmProvider::new(runner.clone());
+    let error = provider
+        .cleanup(&handle(), &CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("read-only"));
+
+    let untagged = br#"{"report":[{"lv":[
+        {"vg_name":"vg-main","lv_name":"zerostun-a1","lv_tags":"","lv_attr":"sri-a-s---"}
+    ]}]}"#;
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(untagged)]);
+    let provider = LvmProvider::new(runner.clone());
+    let error = provider
+        .cleanup(&handle(), &CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("ZeroStun-managed"));
+}
+
+#[tokio::test]
 async fn lvm_rejects_tampered_handle_id_and_path_before_cleanup_mutation() {
     let runner = FakeRunner::scripted([]);
     let provider = LvmProvider::new(runner.clone());
@@ -230,6 +269,30 @@ async fn lvm_rejects_tampered_handle_id_and_path_before_cleanup_mutation() {
             .is_err());
     }
     assert!(runner.recorded().is_empty());
+}
+
+#[tokio::test]
+async fn lvm_open_source_rejects_writable_and_missing_rows() {
+    let writable = br#"{"report":[{"lv":[
+        {"vg_name":"vg-main","lv_name":"zerostun-a1","lv_tags":"zerostun.snapshot","lv_attr":"swi-a-s---"}
+    ]}]}"#;
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(writable)]);
+    let provider = LvmProvider::new(runner.clone());
+    let error = provider
+        .open_source(&handle(), &CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("read-only"));
+    assert_eq!(runner.recorded().len(), 1);
+
+    let missing = EMPTY_LVS;
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(missing)]);
+    let provider = LvmProvider::new(runner.clone());
+    assert!(provider
+        .open_source(&handle(), &CancellationToken::new())
+        .await
+        .is_err());
 }
 
 #[tokio::test]
