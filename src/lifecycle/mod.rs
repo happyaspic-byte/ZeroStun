@@ -11,4 +11,6 @@ pub use repair::{
     FindingKind, FindingSeverity, RepairFinding, RepairPlan, RepairReport, RepairResult,
     RepairScope, DEFAULT_MAX_REPAIR_FINDINGS,
 };
-pub use retention::{evaluate_retention, evaluate_retention_strict, PrunePlan, RetentionPolicy};
+pub use retention::{
+    evaluate_retention, evaluate_retention_strict, PrunePlan, PruneResult, RetentionPolicy,
+};

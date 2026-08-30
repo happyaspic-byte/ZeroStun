@@ -25,7 +25,6 @@ so backups can be verified and restored byte-for-byte.
 - Encryption, signatures, or remote authentication
 - Network replication, S3, or regulatory WORM enforcement
 - Proxmox, everRun, ztC, LVM, or ZFS integration
-- Backup deletion or garbage collection
 
 Rate limits bound backup I/O. They are not a proof that another process on the
 same host will never stall. See `docs/zero-stun-contract.md`.
@@ -55,9 +54,24 @@ zerostun inspect --repo /var/lib/zerostun/repo --backup-id bkp-...
 zerostun verify  --repo /var/lib/zerostun/repo --backup-id bkp-...
 zerostun restore --repo /var/lib/zerostun/repo --backup-id bkp-... --target /tmp/restored.bin
 zerostun list    --repo /var/lib/zerostun/repo
+
+# Lifecycle commands default to dry-run. Mutation requires --apply.
+zerostun delete --repo /var/lib/zerostun/repo --backup-id bkp-...
+zerostun delete --repo /var/lib/zerostun/repo --backup-id bkp-... --apply
+
+zerostun prune --repo /var/lib/zerostun/repo --keep-last 7 --daily-days 14
+zerostun prune --repo /var/lib/zerostun/repo --keep-last 7 --daily-days 14 --apply
+
+zerostun gc --repo /var/lib/zerostun/repo
+zerostun gc --repo /var/lib/zerostun/repo --apply
+
+zerostun repair --repo /var/lib/zerostun/repo
+zerostun repair --repo /var/lib/zerostun/repo --apply
 ```
 
-JSON output is available with `--json`.
+JSON output is available with `--json`. JSON prints the plan or result struct directly.
+
+Delete writes a tombstone. The backup is hidden from list, inspect, verify, and restore, but chunks remain until GC. A tombstone is reversible until GC finalizes it; after GC the backup and unreferenced chunks are gone permanently.
 
 ## Safety notes
 

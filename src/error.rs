@@ -98,6 +98,15 @@ pub enum Error {
 
     #[error("garbage collection error: {0}")]
     GarbageCollection(String),
+
+    #[error("lifecycle plan is stale: {0}")]
+    StalePlan(String),
+
+    #[error("active reader: {0}")]
+    ActiveReader(String),
+
+    #[error("critical repair finding: {0}")]
+    CriticalRepair(String),
 }
 
 impl From<redb::Error> for Error {
@@ -169,6 +178,18 @@ impl Error {
             | Error::RootHashMismatch { .. } => ExitCode::Integrity,
             Error::RestoreTargetExists(_) => ExitCode::TargetExists,
             Error::Cancelled => ExitCode::Cancelled,
+            Error::StalePlan(_) => ExitCode::Repository,
+            Error::ActiveReader(_) => ExitCode::Locked,
+            Error::CriticalRepair(_) => ExitCode::Integrity,
+            Error::GarbageCollection(message) => {
+                if message.contains("active reader") {
+                    ExitCode::Locked
+                } else if message.contains("stale") {
+                    ExitCode::Repository
+                } else {
+                    ExitCode::Generic
+                }
+            }
             _ => ExitCode::Generic,
         }
     }

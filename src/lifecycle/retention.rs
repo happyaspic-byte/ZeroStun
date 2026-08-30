@@ -25,6 +25,12 @@ pub struct PrunePlan {
     pub warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PruneResult {
+    pub keep: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
 pub fn evaluate_retention(
     backups: &[BackupSummaryItem],
     policy: &RetentionPolicy,

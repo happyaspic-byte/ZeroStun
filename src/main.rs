@@ -2,11 +2,13 @@ use std::path::PathBuf;
 use std::process::ExitCode as StdExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 use tracing_subscriber::EnvFilter;
 
 use zerostun::codec::CompressionCodec;
 use zerostun::config::{parse_byte_size, BackupConfig};
-use zerostun::error::ExitCode;
+use zerostun::error::{Error, ExitCode};
+use zerostun::lifecycle::{evaluate_retention, FindingSeverity, PruneResult, RetentionPolicy};
 use zerostun::repository::Repository;
 use zerostun::telemetry::ProgressMode;
 
@@ -60,6 +62,42 @@ enum Commands {
         #[arg(short, long)]
         repo: PathBuf,
     },
+    Delete {
+        #[arg(short, long)]
+        repo: PathBuf,
+        #[arg(long)]
+        backup_id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Prune {
+        #[arg(short, long)]
+        repo: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        keep_last: usize,
+        #[arg(long, default_value_t = 0)]
+        daily_days: u32,
+        #[arg(long, default_value_t = 0)]
+        weekly_weeks: u32,
+        #[arg(long, default_value_t = 0)]
+        monthly_months: u32,
+        #[arg(long = "protect")]
+        protect: Vec<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Gc {
+        #[arg(short, long)]
+        repo: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
+    Repair {
+        #[arg(short, long)]
+        repo: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -101,7 +139,10 @@ struct BackupArgs {
 #[tokio::main]
 async fn main() -> StdExitCode {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
 
     let cli = Cli::parse();
     match run(cli).await {
@@ -278,5 +319,258 @@ async fn run(cli: Cli) -> zerostun::error::Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+        Commands::Delete {
+            repo,
+            backup_id,
+            apply,
+        } => run_delete(repo, backup_id, apply, cli.json, cli.quiet),
+        Commands::Prune {
+            repo,
+            keep_last,
+            daily_days,
+            weekly_weeks,
+            monthly_months,
+            protect,
+            apply,
+        } => run_prune(
+            PruneCommand {
+                repo,
+                keep_last,
+                daily_days,
+                weekly_weeks,
+                monthly_months,
+                protect,
+                apply,
+            },
+            cli.json,
+            cli.quiet,
+        ),
+        Commands::Gc { repo, apply } => run_gc(repo, apply, cli.json, cli.quiet),
+        Commands::Repair { repo, apply } => run_repair(repo, apply, cli.json, cli.quiet),
     }
+}
+
+fn emit_json<T: Serialize>(value: &T) -> zerostun::error::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|e| Error::InvalidConfig(e.to_string()))?
+    );
+    Ok(())
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn map_gc_error(error: Error) -> Error {
+    match error {
+        Error::GarbageCollection(message) if message.contains("active reader") => {
+            Error::ActiveReader(message)
+        }
+        Error::GarbageCollection(message) if message.contains("stale") => Error::StalePlan(message),
+        other => other,
+    }
+}
+
+fn run_delete(
+    repo_path: PathBuf,
+    backup_id: String,
+    apply: bool,
+    json: bool,
+    quiet: bool,
+) -> zerostun::error::Result<ExitCode> {
+    let repo = Repository::open(&repo_path)?;
+    let plan = repo.plan_delete(&backup_id)?;
+    if !apply {
+        if json {
+            emit_json(&plan)?;
+        } else if !quiet {
+            println!("Dry-run delete plan");
+            println!("  Backup ID: {}", plan.backup_id);
+            println!("  Already hidden: {}", plan.already_deleted);
+            println!("  No backup will be hidden until --apply.");
+        }
+        return Ok(ExitCode::Success);
+    }
+
+    let _lock = repo.acquire_writer_lock()?;
+    let current = repo.plan_delete(&backup_id)?;
+    if current != plan {
+        return Err(Error::StalePlan(format!(
+            "delete plan for {backup_id} is no longer current"
+        )));
+    }
+    let result = repo.apply_delete(&plan)?;
+    if json {
+        emit_json(&result)?;
+    } else if !quiet {
+        println!("Applied delete plan.");
+        println!("  Backup ID: {}", result.backup_id);
+        println!("  Hidden: {}", result.tombstoned);
+    }
+    Ok(ExitCode::Success)
+}
+
+struct PruneCommand {
+    repo: PathBuf,
+    keep_last: usize,
+    daily_days: u32,
+    weekly_weeks: u32,
+    monthly_months: u32,
+    protect: Vec<String>,
+    apply: bool,
+}
+
+fn run_prune(command: PruneCommand, json: bool, quiet: bool) -> zerostun::error::Result<ExitCode> {
+    let repo = Repository::open(&command.repo)?;
+    let policy = RetentionPolicy {
+        keep_last: command.keep_last,
+        daily_days: command.daily_days,
+        weekly_weeks: command.weekly_weeks,
+        monthly_months: command.monthly_months,
+        protected_ids: command.protect.into_iter().collect(),
+    };
+    let plan = evaluate_retention(&repo.list_backup_summaries()?, &policy, unix_ms())?;
+    if !command.apply {
+        if json {
+            emit_json(&plan)?;
+        } else if !quiet {
+            println!("Dry-run prune plan");
+            println!("  Keep: {}", plan.keep.len());
+            println!("  Would hide: {}", plan.delete.len());
+            for warning in &plan.warnings {
+                println!("  Warning: {warning}");
+            }
+            println!("  No backups will be hidden until --apply.");
+        }
+        return Ok(ExitCode::Success);
+    }
+
+    let _lock = repo.acquire_writer_lock()?;
+    let current = evaluate_retention(
+        &repo.list_backup_summaries()?,
+        &policy,
+        plan.evaluated_at_unix_ms,
+    )?;
+    if current.keep != plan.keep || current.delete != plan.delete {
+        return Err(Error::StalePlan(
+            "prune plan is no longer current".to_string(),
+        ));
+    }
+    let mut deleted = Vec::new();
+    for backup_id in &plan.delete {
+        let delete_plan = repo.plan_delete(backup_id)?;
+        let result = repo.apply_delete(&delete_plan)?;
+        if result.tombstoned {
+            deleted.push(backup_id.clone());
+        }
+    }
+    let result = PruneResult {
+        keep: plan.keep.clone(),
+        deleted,
+    };
+    if json {
+        emit_json(&result)?;
+    } else if !quiet {
+        println!("Applied prune plan.");
+        println!("  Keep: {}", result.keep.len());
+        println!("  Hidden: {}", result.deleted.len());
+    }
+    Ok(ExitCode::Success)
+}
+
+fn run_gc(
+    repo_path: PathBuf,
+    apply: bool,
+    json: bool,
+    quiet: bool,
+) -> zerostun::error::Result<ExitCode> {
+    let repo = Repository::open(&repo_path)?;
+    let plan = repo.plan_gc().map_err(map_gc_error)?;
+    if !apply {
+        if json {
+            emit_json(&plan)?;
+        } else if !quiet {
+            println!("Dry-run garbage collection plan");
+            println!("  GC ID: {}", plan.gc_id);
+            println!("  Live chunks: {}", plan.live_chunks);
+            println!("  Reclaim chunks: {}", plan.reclaim_chunks.len());
+            println!("  Reclaim bytes: {}", plan.reclaim_bytes);
+            println!("  No chunks will be removed until --apply.");
+        }
+        return Ok(ExitCode::Success);
+    }
+
+    let _lock = repo.acquire_writer_lock()?;
+    let result = repo.apply_gc(&plan).map_err(map_gc_error)?;
+    if json {
+        emit_json(&result)?;
+    } else if !quiet {
+        println!("Applied garbage collection.");
+        println!("  GC ID: {}", result.gc_id);
+        println!("  Reclaimed chunks: {}", result.reclaimed_chunks);
+        println!("  Reclaimed bytes: {}", result.reclaimed_bytes);
+    }
+    Ok(ExitCode::Success)
+}
+
+fn run_repair(
+    repo_path: PathBuf,
+    apply: bool,
+    json: bool,
+    quiet: bool,
+) -> zerostun::error::Result<ExitCode> {
+    let repo = Repository::open(&repo_path)?;
+    let report = repo.inspect_repair()?;
+    let plan = repo.plan_repair(&report)?;
+    let critical = report
+        .findings
+        .iter()
+        .find(|finding| finding.severity == FindingSeverity::Critical)
+        .map(|finding| finding.detail.clone());
+    if !apply {
+        if json {
+            emit_json(&plan)?;
+        } else if !quiet {
+            println!("Dry-run repair plan");
+            println!("  Rebuild index: {}", plan.rebuild_index);
+            println!("  Stale leases: {}", plan.stale_leases.len());
+            println!("  GC recoveries: {}", plan.gc_recoveries.len());
+            println!("  Findings: {}", report.findings.len());
+            println!("  No repair mutations will run until --apply.");
+        }
+        if let Some(detail) = critical {
+            return Err(Error::CriticalRepair(detail));
+        }
+        return Ok(ExitCode::Success);
+    }
+
+    if let Some(detail) = critical {
+        if json {
+            emit_json(&plan)?;
+        }
+        return Err(Error::CriticalRepair(detail));
+    }
+
+    let _lock = repo.acquire_writer_lock()?;
+    let current_report = repo.inspect_repair()?;
+    let current = repo.plan_repair(&current_report)?;
+    if current != plan {
+        return Err(Error::StalePlan(
+            "repair plan is no longer current".to_string(),
+        ));
+    }
+    let result = repo.apply_repair(&plan)?;
+    if json {
+        emit_json(&result)?;
+    } else if !quiet {
+        println!("Applied repair plan.");
+        println!("  Rebuilt index: {}", result.rebuilt_index);
+        println!("  Removed leases: {}", result.removed_leases.len());
+        println!("  GC recoveries: {}", result.gc_recoveries.len());
+    }
+    Ok(ExitCode::Success)
 }

@@ -20,8 +20,9 @@ pub use engine::{backup, inspect, restore, verify, BackupSummary, InspectReport,
 pub use error::{Error, ExitCode};
 pub use lifecycle::{
     ChunkMove, DeletePlan, DeleteResult, FindingKind, FindingSeverity, GcJournal, GcPhase, GcPlan,
-    GcRecoveryResult, GcResult, GcTombstone, RepairFinding, RepairPlan, RepairReport, RepairResult,
-    RepairScope, UndeletePlan, UndeleteResult, DEFAULT_MAX_REPAIR_FINDINGS,
+    GcRecoveryResult, GcResult, GcTombstone, PrunePlan, PruneResult, RepairFinding, RepairPlan,
+    RepairReport, RepairResult, RepairScope, UndeletePlan, UndeleteResult,
+    DEFAULT_MAX_REPAIR_FINDINGS,
 };
 pub use lifecycle::{ReaderLease, ReaderLeaseGuard};
 pub use repository::{BackupSummaryItem, Repository};
