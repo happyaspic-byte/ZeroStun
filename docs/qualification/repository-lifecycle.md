@@ -73,7 +73,7 @@ Destructive commands default to dry-run. Human dry-run output does not claim del
 - `verify` maps GC-barrier lease refusal into `VerifyReport { is_valid: false }` rather than a dedicated locked exit. Restore propagates the GC error.
 - Directory `fsync` is a Unix contract; non-Unix is a no-op.
 - Repair never fabricates missing or corrupt chunk bytes.
-- Snapshot adapters, daemon, distribution, and hardware labs are out of scope for this qualification. LVM and ZFS provider contracts are qualified separately in `docs/qualification/lvm-zfs-snapshot-providers.md`.
+- Snapshot adapters, distribution, and hardware labs are out of scope for this qualification. LVM and ZFS provider contracts are qualified separately in `docs/qualification/lvm-zfs-snapshot-providers.md`, and daemon operations in `docs/qualification/daemon-operations.md`.
 
 ## Score contribution
 

@@ -1,0 +1,14 @@
+state_db = "/var/lib/zerostun/daemon.redb"
+shutdown_deadline_ms = 30000
+
+[[jobs]]
+id = "daily-root"
+provider = "lvm"
+target = "vg/root"
+interval_seconds = 3600
+timezone = "UTC"
+
+[jobs.retry]
+max_attempts = 3
+initial_delay_ms = 100
+max_delay_ms = 1600

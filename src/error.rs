@@ -110,6 +110,21 @@ pub enum Error {
 
     #[error("snapshot error: {0}")]
     Snapshot(String),
+
+    #[error("daemon error: {0}")]
+    Daemon(String),
+
+    #[error("daemon shutdown exceeded its cleanup deadline")]
+    ShutdownDeadline,
+
+    #[error("daemon run {run_id} is not a running job")]
+    RunNotActive { run_id: String },
+
+    #[error("daemon job {job_id} already has an active run")]
+    JobAlreadyRunning { job_id: String },
+
+    #[error("daemon configuration error: {0}")]
+    InvalidDaemonConfig(String),
 }
 
 impl From<redb::Error> for Error {
@@ -164,9 +179,10 @@ pub enum ExitCode {
 impl Error {
     pub fn exit_code(&self) -> ExitCode {
         match self {
-            Error::InvalidConfig(_) | Error::InvalidIdentifier(_) | Error::PathTraversal(_) => {
-                ExitCode::InvalidConfig
-            }
+            Error::InvalidConfig(_)
+            | Error::InvalidDaemonConfig(_)
+            | Error::InvalidIdentifier(_)
+            | Error::PathTraversal(_) => ExitCode::InvalidConfig,
             Error::RepositoryNotInitialized(_)
             | Error::NotARepository(_)
             | Error::UnsupportedRepositoryVersion { .. }

@@ -7,6 +7,7 @@ use tracing_subscriber::EnvFilter;
 
 use zerostun::codec::CompressionCodec;
 use zerostun::config::{parse_byte_size, BackupConfig};
+use zerostun::daemon::{DaemonConfig, DaemonState, RunStatus};
 use zerostun::error::{Error, ExitCode};
 use zerostun::lifecycle::{evaluate_retention, FindingSeverity, PruneResult, RetentionPolicy};
 use zerostun::repository::Repository;
@@ -97,6 +98,49 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)]
         apply: bool,
+    },
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
+    #[command(subcommand)]
+    Jobs(JobsCommand),
+    #[command(subcommand)]
+    Runs(RunsCommand),
+    Cancel {
+        run_id: String,
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Metrics {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCommand {
+    Run {
+        #[arg(long)]
+        config: PathBuf,
+    },
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum JobsCommand {
+    List {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RunsCommand {
+    List {
+        #[arg(long)]
+        config: PathBuf,
     },
 }
 
@@ -347,7 +391,143 @@ async fn run(cli: Cli) -> zerostun::error::Result<ExitCode> {
         ),
         Commands::Gc { repo, apply } => run_gc(repo, apply, cli.json, cli.quiet),
         Commands::Repair { repo, apply } => run_repair(repo, apply, cli.json, cli.quiet),
+        Commands::Daemon(DaemonCommand::Status { config }) => {
+            let parsed = DaemonConfig::load(&config)?;
+            let state = DaemonState::open(&parsed.state_db)?;
+            let metrics = state.metrics()?;
+            let jobs = state.jobs()?;
+            let status = serde_json::json!({
+                "jobs": jobs.len(),
+                "runs_queued": metrics.runs_queued,
+                "runs_running": metrics.runs_running,
+                "runs_succeeded": metrics.runs_succeeded,
+                "runs_failed": metrics.runs_failed,
+                "runs_cancelled": metrics.runs_cancelled,
+                "runs_recovering": metrics.runs_recovering,
+            });
+            emit_json(&status)?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Daemon(DaemonCommand::Run { config }) => {
+            let parsed = DaemonConfig::load(&config)?;
+            run_daemon(&parsed).await
+        }
+        Commands::Jobs(JobsCommand::List { config }) => {
+            let parsed = DaemonConfig::load(&config)?;
+            let state = DaemonState::open(&parsed.state_db)?;
+            let jobs = state.jobs()?;
+            emit_json(&jobs)?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Runs(RunsCommand::List { config }) => {
+            let parsed = DaemonConfig::load(&config)?;
+            let state = DaemonState::open(&parsed.state_db)?;
+            let runs = state.runs()?;
+            emit_json(&runs)?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Cancel { run_id, config } => {
+            let parsed = DaemonConfig::load(&config)?;
+            let state = DaemonState::open(&parsed.state_db)?;
+            let run = state
+                .get_run(&run_id)?
+                .ok_or_else(|| zerostun::Error::RunNotActive {
+                    run_id: run_id.clone(),
+                })?;
+            if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                return Err(zerostun::Error::RunNotActive {
+                    run_id: run_id.clone(),
+                });
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            let updated = state.transition(&run_id, RunStatus::Cancelled, now, None)?;
+            emit_json(&updated)?;
+            Ok(ExitCode::Success)
+        }
+        Commands::Metrics { config } => {
+            let parsed = DaemonConfig::load(&config)?;
+            let state = DaemonState::open(&parsed.state_db)?;
+            let metrics = state.metrics()?;
+            emit_json(&metrics)?;
+            Ok(ExitCode::Success)
+        }
     }
+}
+
+async fn run_daemon(config: &DaemonConfig) -> zerostun::error::Result<ExitCode> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use zerostun::daemon::{DaemonRunner, ManualClock, Scheduler};
+    use zerostun::snapshot::{FakeProvider, FakeRunner};
+
+    let state = if config.state_db.exists() {
+        DaemonState::open(&config.state_db)?
+    } else {
+        DaemonState::create(&config.state_db)?
+    };
+    for job in &config.jobs {
+        state.put_job(job)?;
+    }
+    let now = unix_ms();
+    let _ = state.recover_interrupted(now)?;
+    let shutdown = zerostun::daemon::ShutdownController::new(Duration::from_millis(
+        config.shutdown_deadline_ms,
+    ));
+    let token = shutdown.running_token();
+    let clock = ManualClock::new(now);
+    let scheduler = Scheduler::new(clock.clone());
+    let runner = DaemonRunner::new(
+        Arc::new(FakeProvider::new(FakeRunner::scripted([]))),
+        clock.clone(),
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).map_err(|error| {
+            zerostun::Error::Daemon(format!("failed to install SIGTERM handler: {error}"))
+        })?;
+        loop {
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    shutdown.request_shutdown();
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                    if !shutdown.admission_allowed() {
+                        break;
+                    }
+                    clock.set(unix_ms());
+                    let due = scheduler.due_jobs(&state, &config.jobs)?;
+                    for due_job in due {
+                        if !shutdown.admission_allowed() {
+                            break;
+                        }
+                        if let Some(job) = config.jobs.iter().find(|job| job.id == due_job.job_id) {
+                            let _ = runner.run_job(&state, job, &token).await;
+                            state.set_last_scheduled(&job.id, clock.now_unix_ms())?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        wait_for_sigterm(token.clone()).await;
+        shutdown.request_shutdown();
+    }
+
+    shutdown
+        .wait_for_cleanup(async {
+            let _ = state.recover_interrupted(unix_ms());
+        })
+        .await?;
+    Ok(ExitCode::Success)
 }
 
 fn emit_json<T: Serialize>(value: &T) -> zerostun::error::Result<()> {

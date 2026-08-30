@@ -1,0 +1,38 @@
+[Unit]
+Description=ZeroStun backup daemon
+Documentation=https://github.com/happyaspic-byte/ZeroStun
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/zerostun daemon run --config /etc/zerostun/daemon.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+KillSignal=SIGTERM
+DynamicUser=yes
+User=zerostun
+Group=zerostun
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/zerostun /run/zerostun
+DeviceAllow=/dev/mapper/* r
+DeviceAllow=/dev/zvol/* r
+DevicePolicy=closed
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

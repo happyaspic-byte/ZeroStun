@@ -83,6 +83,16 @@ zerostun gc --repo /var/lib/zerostun/repo --apply
 
 zerostun repair --repo /var/lib/zerostun/repo
 zerostun repair --repo /var/lib/zerostun/repo --apply
+
+zerostun daemon status --config /etc/zerostun/daemon.toml --json
+zerostun jobs list --config /etc/zerostun/daemon.toml --json
+zerostun runs list --config /etc/zerostun/daemon.toml --json
+zerostun cancel <run-id> --config /etc/zerostun/daemon.toml --json
+zerostun metrics --json --config /etc/zerostun/daemon.toml
+zerostun daemon run --config /etc/zerostun/daemon.toml
+
+A hardened systemd unit and sample job configuration live in
+`packaging/zerostun-daemon.service` and `packaging/daemon.toml`.
 ```
 
 JSON output is available with `--json`. JSON prints the plan or result struct directly.

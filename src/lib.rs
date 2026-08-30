@@ -4,6 +4,7 @@
 pub mod chunking;
 pub mod codec;
 pub mod config;
+pub mod daemon;
 pub mod engine;
 pub mod error;
 pub mod hash;
