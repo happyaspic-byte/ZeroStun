@@ -67,19 +67,36 @@ impl CommandSpec {
 
 impl fmt::Debug for CommandSpec {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args: Vec<String> = self.args.iter().map(|arg| redact_text(self, arg)).collect();
         f.debug_struct("CommandSpec")
             .field("program", &self.program)
-            .field("args", &self.args)
+            .field("args", &args)
             .field("env", &self.env_for_debug())
             .field("secret_env", &self.secret_env)
             .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RecordedCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
+    redacted_args: Option<Vec<String>>,
+}
+
+impl RecordedCommand {
+    fn redacted_args(&self) -> &[String] {
+        self.redacted_args.as_ref().unwrap_or(&self.args)
+    }
+}
+
+impl fmt::Debug for RecordedCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordedCommand")
+            .field("program", &self.program)
+            .field("args", &self.redacted_args())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +180,10 @@ impl CommandRunner for FakeRunner {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<CommandOutput>> {
         Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(Error::Cancelled);
+            }
+
             {
                 let mut recorded = self
                     .recorded
@@ -171,6 +192,9 @@ impl CommandRunner for FakeRunner {
                 recorded.push(RecordedCommand {
                     program: spec.program.clone(),
                     args: spec.args.clone(),
+                    redacted_args: Some(
+                        spec.args.iter().map(|arg| redact_text(spec, arg)).collect(),
+                    ),
                 });
             }
 
@@ -183,10 +207,6 @@ impl CommandRunner for FakeRunner {
                     .pop_front()
                     .ok_or_else(|| Error::Snapshot("no scripted command remaining".to_string()))?
             };
-
-            if cancel.is_cancelled() {
-                return Err(Error::Cancelled);
-            }
 
             match script {
                 FakeRunnerScript::Hang { duration } => {
@@ -261,19 +281,19 @@ fn finish_output(
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 ) -> Result<CommandOutput> {
-    if stdout.len() > MAX_COMMAND_OUTPUT_BYTES || stderr.len() > MAX_COMMAND_OUTPUT_BYTES {
-        return Err(Error::Snapshot(
-            "snapshot command output exceeds bounded maximum".to_string(),
-        ));
-    }
     if status != 0 {
-        let stdout_text = String::from_utf8_lossy(&stdout);
-        let stderr_text = String::from_utf8_lossy(&stderr);
+        let stdout_text = bounded_lossy(&stdout);
+        let stderr_text = bounded_lossy(&stderr);
         let combined = format!("{stdout_text}{stderr_text}");
         return Err(Error::Snapshot(format!(
             "snapshot command failed with status {status}: {}",
             redact_text(spec, &combined)
         )));
+    }
+    if stdout.len() > MAX_COMMAND_OUTPUT_BYTES || stderr.len() > MAX_COMMAND_OUTPUT_BYTES {
+        return Err(Error::Snapshot(
+            "snapshot command output exceeds bounded maximum".to_string(),
+        ));
     }
     Ok(CommandOutput {
         stdout,
@@ -282,13 +302,29 @@ fn finish_output(
     })
 }
 
+fn bounded_lossy(bytes: &[u8]) -> String {
+    let slice = if bytes.len() > MAX_COMMAND_OUTPUT_BYTES {
+        &bytes[..MAX_COMMAND_OUTPUT_BYTES]
+    } else {
+        bytes
+    };
+    String::from_utf8_lossy(slice).into_owned()
+}
+
 fn bounded_output_error() -> Error {
     Error::Snapshot("snapshot command output exceeds bounded maximum".to_string())
 }
 
 async fn reap(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
-    let _ = child.wait().await;
+    let _ = tokio::time::timeout(Duration::from_millis(100), child.wait()).await;
+}
+
+fn env_is_allowed(key: &str) -> bool {
+    matches!(
+        key,
+        "PATH" | "HOME" | "TMPDIR" | "TEMP" | "TMP" | "LANG" | "LC_ALL" | "TZ"
+    )
 }
 
 async fn run_process(
@@ -302,6 +338,12 @@ async fn run_process(
 
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
+    command.env_clear();
+    for (key, value) in std::env::vars() {
+        if env_is_allowed(&key) {
+            command.env(key, value);
+        }
+    }
     for (key, value) in &spec.env {
         command.env(key, value);
     }

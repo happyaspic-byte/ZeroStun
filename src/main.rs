@@ -396,7 +396,6 @@ fn run_delete(
         return Ok(ExitCode::Success);
     }
 
-    let _lock = repo.acquire_writer_lock()?;
     let current = repo.plan_delete(&backup_id)?;
     if current != plan {
         return Err(Error::StalePlan(format!(
@@ -463,7 +462,7 @@ fn run_prune(command: PruneCommand, json: bool, quiet: bool) -> zerostun::error:
     let mut deleted = Vec::new();
     for backup_id in &plan.delete {
         let delete_plan = repo.plan_delete(backup_id)?;
-        let result = repo.apply_delete(&delete_plan)?;
+        let result = repo.apply_delete_locked(&delete_plan)?;
         if result.tombstoned {
             deleted.push(backup_id.clone());
         }
@@ -504,7 +503,6 @@ fn run_gc(
         return Ok(ExitCode::Success);
     }
 
-    let _lock = repo.acquire_writer_lock()?;
     let result = repo.apply_gc(&plan).map_err(map_gc_error)?;
     if json {
         emit_json(&result)?;
@@ -555,7 +553,6 @@ fn run_repair(
         return Err(Error::CriticalRepair(detail));
     }
 
-    let _lock = repo.acquire_writer_lock()?;
     let current_report = repo.inspect_repair()?;
     let current = repo.plan_repair(&current_report)?;
     if current != plan {

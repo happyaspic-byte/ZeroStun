@@ -405,3 +405,31 @@ fn apply_repair_removes_only_proven_stale_leases() {
     assert_eq!(result.removed_leases, vec!["lease-dead".to_string()]);
     assert!(repo.active_reader_leases().unwrap().is_empty());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repair_apply_unblocks_gc_after_proven_stale_lease() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    commit_payloads(&repo, "backup-lease", &[b"lease-payload"]);
+    drop(repo);
+    insert_lease(
+        &repo_path,
+        &ReaderLease {
+            lease_id: "lease-dead".to_string(),
+            backup_id: "backup-lease".to_string(),
+            pid: u32::MAX,
+            process_start_token: "0".to_string(),
+            acquired_unix_ms: 1,
+        },
+    );
+    let repo = Repository::open(&repo_path).unwrap();
+    assert!(!repo.active_reader_leases().unwrap().is_empty());
+    let report = repo.inspect_repair().unwrap();
+    let plan = repo.plan_repair(&report).unwrap();
+    assert!(plan.stale_leases.contains(&"lease-dead".to_string()));
+    repo.apply_repair(&plan).unwrap();
+    assert!(repo.active_reader_leases().unwrap().is_empty());
+    assert!(repo.plan_gc().is_ok());
+}

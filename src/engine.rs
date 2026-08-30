@@ -98,6 +98,7 @@ pub async fn backup(
     }
 
     let _lock = repo.acquire_writer_lock()?;
+    repo.refuse_when_gc_in_progress()?;
     let chunk_params = config.validate()?;
 
     let source = FileSource::open(&source_canon)?;
@@ -253,7 +254,7 @@ pub async fn backup(
     source.verify_unchanged()?;
 
     manifest.root_hash = root_hash_from_manifest(&manifest);
-    repo.commit_manifest(&manifest)?;
+    repo.commit_manifest_locked(&manifest)?;
 
     let total_chunks = unique_chunks + reused_chunks;
     let dedupe_ratio = if stored_bytes > 0 {
@@ -306,7 +307,13 @@ fn pause_after_lease_acquisition() {}
 pub async fn verify(repo: &Repository, backup_id: &str) -> Result<VerifyReport> {
     let (manifest, _lease) = match repo.resolve_manifest_with_reader_lease(backup_id) {
         Ok(resolved) => resolved,
-        Err(error @ (Error::BackupNotFound(_) | Error::BackupDeleted(_))) => return Err(error),
+        Err(
+            error @ (Error::BackupNotFound(_)
+            | Error::BackupDeleted(_)
+            | Error::GarbageCollection(_)
+            | Error::ActiveReader(_)
+            | Error::RepositoryLocked(_)),
+        ) => return Err(error),
         Err(e) => {
             return Ok(VerifyReport {
                 backup_id: backup_id.to_string(),

@@ -170,12 +170,11 @@ impl Repository {
         Ok(plan_from_snapshot(&snapshot))
     }
 
-    /// Applies a repair plan. The caller owns the exclusive writer lock in CLI
-    /// orchestration; this primitive does not acquire a nested lock.
     pub fn apply_repair(&self, plan: &RepairPlan) -> Result<RepairResult> {
+        let _lock = self.acquire_writer_lock()?;
         let mut gc_recoveries = Vec::new();
         if !plan.gc_recoveries.is_empty() {
-            let recovered = self.recover_gc()?;
+            let recovered = self.recover_gc_locked()?;
             gc_recoveries = recovered.into_iter().map(|item| item.gc_id).collect();
         }
 

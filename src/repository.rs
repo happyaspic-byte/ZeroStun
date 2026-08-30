@@ -302,7 +302,13 @@ impl Repository {
     }
 
     pub fn commit_manifest(&self, manifest: &Manifest) -> Result<()> {
+        let _lock = self.acquire_writer_lock()?;
+        self.commit_manifest_locked(manifest)
+    }
+
+    pub(crate) fn commit_manifest_locked(&self, manifest: &Manifest) -> Result<()> {
         validate_backup_id(&manifest.backup_id)?;
+        self.refuse_when_gc_in_progress()?;
         self.ensure_backup_id_available(&manifest.backup_id)?;
         let encoded = manifest.encode()?;
         let target = self
@@ -385,6 +391,12 @@ impl Repository {
 
     /// Applies a delete plan. The caller must hold the repository writer lock.
     pub fn apply_delete(&self, plan: &DeletePlan) -> Result<DeleteResult> {
+        let _lock = self.acquire_writer_lock()?;
+        self.apply_delete_locked(plan)
+    }
+
+    pub fn apply_delete_locked(&self, plan: &DeletePlan) -> Result<DeleteResult> {
+        self.refuse_when_gc_in_progress()?;
         validate_backup_id(&plan.backup_id)?;
         let db = self.database()?;
         let write_txn = db.begin_write()?;
@@ -425,8 +437,13 @@ impl Repository {
         })
     }
 
-    /// Applies an undelete plan. The caller must hold the repository writer lock.
     pub fn apply_undelete(&self, plan: &UndeletePlan) -> Result<UndeleteResult> {
+        let _lock = self.acquire_writer_lock()?;
+        self.apply_undelete_locked(plan)
+    }
+
+    pub(crate) fn apply_undelete_locked(&self, plan: &UndeletePlan) -> Result<UndeleteResult> {
+        self.refuse_when_gc_in_progress()?;
         validate_backup_id(&plan.backup_id)?;
         let db = self.database()?;
         let write_txn = db.begin_write()?;
@@ -500,6 +517,23 @@ impl Repository {
         read_active_reader_leases(&read_txn)
     }
 
+    pub(crate) fn refuse_when_gc_in_progress(&self) -> Result<()> {
+        let db = self.database()?;
+        let read_txn = db.begin_read()?;
+        let state = read_txn.open_table(GC_STATE)?;
+        let barrier = state.get(GC_BARRIER_KEY)?.is_some();
+        drop(state);
+        let journals = read_txn.open_table(GC_JOURNALS)?;
+        let journal = journals.iter()?.next().transpose()?.is_some();
+        if barrier || journal {
+            return Err(Error::GarbageCollection(
+                "repository mutation refused while garbage collection recovery is pending"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn allocate_gc_id(&self) -> Result<String> {
         const MAX_ATTEMPTS: usize = 8;
         for _ in 0..MAX_ATTEMPTS {
@@ -522,6 +556,10 @@ impl Repository {
     }
 
     pub fn plan_gc(&self) -> Result<GcPlan> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.remove_stale_reader_leases()?;
+        }
         let db = self.database()?;
         let read_txn = db.begin_read()?;
         if !read_active_reader_leases(&read_txn)?.is_empty() {
@@ -553,7 +591,7 @@ impl Repository {
             }
             for chunk in manifest.chunks {
                 if let Some(existing) = live.insert(chunk.content_id, chunk.clone()) {
-                    if existing.codec != chunk.codec
+                    if existing.codec.type_tag() != chunk.codec.type_tag()
                         || existing.original_length != chunk.original_length
                         || existing.stored_length != chunk.stored_length
                     {
@@ -658,15 +696,17 @@ impl Repository {
         })
     }
 
-    /// Applies a GC plan. The caller must hold the repository writer lock.
-    ///
-    /// This primitive intentionally does not acquire a nested OS writer lock. Task 6 callers
-    /// acquire the lock and revalidate the plan before calling this method.
+    /// Applies a GC plan under the repository writer lock.
     pub fn apply_gc(&self, plan: &GcPlan) -> Result<GcResult> {
-        self.apply_gc_inner(plan, None)
+        let _lock = self.acquire_writer_lock()?;
+        self.apply_gc_locked(plan, None)
     }
 
-    fn apply_gc_inner(&self, plan: &GcPlan, fault: Option<GcFaultPoint>) -> Result<GcResult> {
+    fn apply_gc_locked(&self, plan: &GcPlan, fault: Option<GcFaultPoint>) -> Result<GcResult> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.remove_stale_reader_leases()?;
+        }
         if !self.active_reader_leases()?.is_empty() {
             return Err(Error::GarbageCollection(
                 "garbage collection refused while active reader leases exist".to_string(),
@@ -720,13 +760,21 @@ impl Repository {
 
     #[cfg(test)]
     fn apply_gc_with_fault(&self, plan: &GcPlan, fault: GcFaultPoint) -> Result<GcResult> {
-        self.apply_gc_inner(plan, Some(fault))
+        let _lock = self.acquire_writer_lock()?;
+        self.apply_gc_locked(plan, Some(fault))
     }
 
-    /// Recovers interrupted GC work. The caller must hold the repository writer lock.
-    ///
-    /// This low-level primitive intentionally does not acquire a nested OS writer lock.
+    /// Recovers interrupted GC work under the repository writer lock.
     pub fn recover_gc(&self) -> Result<Vec<GcRecoveryResult>> {
+        let _lock = self.acquire_writer_lock()?;
+        self.recover_gc_locked()
+    }
+
+    pub(crate) fn recover_gc_locked(&self) -> Result<Vec<GcRecoveryResult>> {
+        #[cfg(target_os = "linux")]
+        {
+            let _ = self.remove_stale_reader_leases()?;
+        }
         let db = self.database()?;
         let read_txn = db.begin_read()?;
         let table = read_txn.open_table(GC_JOURNALS)?;
@@ -742,26 +790,36 @@ impl Repository {
         let mut results = Vec::new();
         for mut journal in journals {
             validate_gc_journal_plan(&journal.plan, &self.root)?;
-            match journal.phase {
-                GcPhase::Planned | GcPhase::Moving => {
-                    ensure_gc_barrier(&db)?;
-                    rollback_gc_moves(&self.root, &journal.plan)?;
-                    remove_gc_trash_directories(&self.root, &journal.plan)?;
-                    remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
+            let mut installed_barrier = false;
+            let outcome: Result<()> = (|| {
+                match journal.phase {
+                    GcPhase::Planned | GcPhase::Moving => {
+                        installed_barrier = ensure_gc_barrier(&db)?;
+                        rollback_gc_moves(&self.root, &journal.plan)?;
+                        remove_gc_trash_directories(&self.root, &journal.plan)?;
+                        remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
+                    }
+                    GcPhase::Committed | GcPhase::Deleting => {
+                        installed_barrier = ensure_gc_barrier(&db)?;
+                        validate_recovery_live_set(&db, &journal.plan)?;
+                        journal.phase = GcPhase::Deleting;
+                        delete_gc_trash(&self.root, &journal.plan)?;
+                        self.finalize_gc_tombstones(&journal.plan.tombstones)?;
+                        remove_gc_trash_directories(&self.root, &journal.plan)?;
+                        remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
+                    }
+                    GcPhase::Complete => {
+                        remove_gc_trash_directories(&self.root, &journal.plan)?;
+                        remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
+                    }
                 }
-                GcPhase::Committed | GcPhase::Deleting => {
-                    ensure_gc_barrier(&db)?;
-                    validate_recovery_live_set(&db, &journal.plan)?;
-                    journal.phase = GcPhase::Deleting;
-                    delete_gc_trash(&self.root, &journal.plan)?;
-                    self.finalize_gc_tombstones(&journal.plan.tombstones)?;
-                    remove_gc_trash_directories(&self.root, &journal.plan)?;
-                    remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
+                Ok(())
+            })();
+            if let Err(error) = outcome {
+                if installed_barrier {
+                    remove_gc_barrier_only(&db)?;
                 }
-                GcPhase::Complete => {
-                    remove_gc_trash_directories(&self.root, &journal.plan)?;
-                    remove_gc_journal_and_barrier(&db, &self.root, &journal.plan.gc_id)?;
-                }
+                return Err(error);
             }
             results.push(GcRecoveryResult {
                 gc_id: journal.plan.gc_id,
@@ -807,16 +865,33 @@ impl Repository {
         {
             let mut tombstones = write_txn.open_table(TOMBSTONES)?;
             let mut backups = write_txn.open_table(TABLE_BACKUPS)?;
+            let mut chunks = write_txn.open_table(TABLE_CHUNKS)?;
             for tombstone in planned {
-                match tombstones.get(tombstone.backup_id.as_str())? {
-                    Some(value) if value.value() == tombstone.deleted_unix_ms => {}
+                let removed_backup = match tombstones.get(tombstone.backup_id.as_str())? {
+                    Some(value) if value.value() == tombstone.deleted_unix_ms => {
+                        backups.remove(tombstone.backup_id.as_str())?
+                    }
                     _ => {
                         return Err(Error::GarbageCollection(
                             "stale GC tombstone set".to_string(),
                         ))
                     }
+                };
+                if let Some(encoded) = removed_backup {
+                    let manifest = Manifest::decode(encoded.value())?;
+                    for chunk in &manifest.chunks {
+                        let hex = chunk.content_id.to_hex();
+                        let remaining = chunks
+                            .get(hex.as_str())?
+                            .map(|value| value.value())
+                            .unwrap_or(0);
+                        if remaining > 1 {
+                            chunks.insert(hex.as_str(), remaining - 1)?;
+                        } else {
+                            chunks.remove(hex.as_str())?;
+                        }
+                    }
                 }
-                let _ = backups.remove(tombstone.backup_id.as_str())?;
                 let _ = tombstones.remove(tombstone.backup_id.as_str())?;
             }
         }
@@ -987,9 +1062,9 @@ fn install_gc_barrier_and_journal(db: &Database, root: &Path, journal: &GcJourna
     sync_database_parent(root)
 }
 
-fn ensure_gc_barrier(db: &Database) -> Result<()> {
+fn ensure_gc_barrier(db: &Database) -> Result<bool> {
     let write_txn = db.begin_write()?;
-    {
+    let installed = {
         let leases = write_txn.open_table(READER_LEASES)?;
         if leases.iter()?.next().is_some() {
             return Err(Error::GarbageCollection(
@@ -1000,7 +1075,7 @@ fn ensure_gc_barrier(db: &Database) -> Result<()> {
         let mut state = write_txn.open_table(GC_STATE)?;
         let barrier = state.get(GC_BARRIER_KEY)?.map(|value| value.value());
         match barrier {
-            Some(value) if value == GC_BARRIER_VALUE => {}
+            Some(value) if value == GC_BARRIER_VALUE => false,
             Some(_) => {
                 return Err(Error::GarbageCollection(
                     "invalid garbage collection barrier state".to_string(),
@@ -1008,11 +1083,12 @@ fn ensure_gc_barrier(db: &Database) -> Result<()> {
             }
             None => {
                 state.insert(GC_BARRIER_KEY, GC_BARRIER_VALUE)?;
+                true
             }
         }
-    }
+    };
     write_txn.commit()?;
-    Ok(())
+    Ok(installed)
 }
 
 fn persist_gc_journal(db: &Database, journal: &GcJournal) -> Result<()> {
@@ -1029,6 +1105,16 @@ fn persist_gc_journal(db: &Database, journal: &GcJournal) -> Result<()> {
 fn persist_gc_journal_durable(db: &Database, root: &Path, journal: &GcJournal) -> Result<()> {
     persist_gc_journal(db, journal)?;
     sync_database_parent(root)
+}
+
+fn remove_gc_barrier_only(db: &Database) -> Result<()> {
+    let write_txn = db.begin_write()?;
+    {
+        let mut state = write_txn.open_table(GC_STATE)?;
+        let _ = state.remove(GC_BARRIER_KEY)?;
+    }
+    write_txn.commit()?;
+    Ok(())
 }
 
 fn remove_gc_journal_and_barrier(db: &Database, root: &Path, gc_id: &str) -> Result<()> {
@@ -1381,7 +1467,9 @@ pub(crate) fn validate_chunk_file(
                 reason: "original chunk exceeds bounded maximum".to_string(),
             });
         }
-        if chunk.codec != stored.codec || chunk.stored_length != stored.payload.len() as u64 {
+        if chunk.codec.type_tag() != stored.codec.type_tag()
+            || chunk.stored_length != stored.payload.len() as u64
+        {
             return Err(Error::ChunkCorrupt {
                 content_id: content_id.to_hex(),
                 reason: "stored chunk metadata does not match manifest".to_string(),

@@ -2,6 +2,8 @@ use redb::{Database, ReadableDatabase, TableDefinition};
 use zerostun::codec::CompressionCodec;
 use zerostun::config::BackupConfig;
 use zerostun::error::Error;
+use zerostun::hash::root_hash_from_manifest;
+use zerostun::manifest::Manifest;
 use zerostun::repository::Repository;
 
 struct BackupFixture {
@@ -87,6 +89,29 @@ async fn restore_uses_single_reader_lease() {
         .unwrap();
     assert_eq!(std::fs::read(target).unwrap(), fixture.source_bytes);
     assert!(fixture.repo.active_reader_leases().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn verify_propagates_gc_barrier_as_operational_error() {
+    const GC_STATE: TableDefinition<&str, u8> = TableDefinition::new("gc_state");
+    let fixture = backup_fixture().await;
+    let repo_path = fixture.repo.root().to_path_buf();
+    let backup_id = fixture.backup_id.clone();
+    drop(fixture.repo);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut state = write.open_table(GC_STATE).unwrap();
+        state.insert("barrier", 1).unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    let repo = Repository::open(&repo_path).unwrap();
+
+    let error = zerostun::engine::verify(&repo, &backup_id)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::GarbageCollection(_)));
 }
 
 #[test]
@@ -200,7 +225,7 @@ fn insert_lease(repo_path: &std::path::Path, lease: &zerostun::ReaderLease) {
 
 fn commit_payloads(repo: &Repository, backup_id: &str, payloads: &[&[u8]]) -> Vec<String> {
     use zerostun::hash::{content_id_from_bytes, root_hash_from_manifest};
-    use zerostun::manifest::{ChunkDescriptor, Manifest};
+    use zerostun::manifest::Manifest;
 
     let mut manifest = Manifest::new(backup_id, 0, 64, 128, 256);
     let mut offset = 0_u64;
@@ -209,7 +234,7 @@ fn commit_payloads(repo: &Repository, backup_id: &str, payloads: &[&[u8]]) -> Ve
         let cid = content_id_from_bytes(payload);
         repo.write_chunk(&cid, CompressionCodec::None, payload)
             .unwrap();
-        manifest.add_chunk(ChunkDescriptor {
+        manifest.add_chunk(zerostun::manifest::ChunkDescriptor {
             index: index as u64,
             logical_offset: offset,
             original_length: payload.len() as u64,
@@ -272,6 +297,63 @@ fn gc_reclaims_last_reference_and_orphan() {
     assert_eq!(result.reclaimed_chunks, plan.reclaim_chunks.len() as u64);
     assert_eq!(result.reclaimed_bytes, plan.reclaim_bytes);
     assert!(repo.plan_undelete("backup-only").is_err());
+}
+
+#[test]
+fn gc_accepts_backup_with_non_default_zstd_level() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"zstd-level-payload");
+    let payload_len = b"zstd-level-payload".len() as u64;
+    let encoded = zerostun::codec::Compressor::compress(
+        CompressionCodec::Zstd { level: 7 },
+        b"zstd-level-payload",
+    )
+    .unwrap();
+    let stored_len = encoded.len() as u64;
+    repo.write_chunk(&cid, CompressionCodec::Zstd { level: 7 }, &encoded)
+        .unwrap();
+    let mut manifest = Manifest::new("backup-zstd-7", payload_len, 64, 128, 256);
+    manifest.add_chunk(zerostun::manifest::ChunkDescriptor {
+        index: 0,
+        logical_offset: 0,
+        original_length: payload_len,
+        stored_length: stored_len,
+        codec: CompressionCodec::Zstd { level: 7 },
+        content_id: cid,
+    });
+    manifest.root_hash = root_hash_from_manifest(&manifest);
+    repo.commit_manifest(&manifest).unwrap();
+
+    let plan = repo.plan_gc().unwrap();
+    assert!(plan.reclaim_chunks.is_empty());
+    assert!(repo.apply_gc(&plan).is_ok());
+}
+
+#[test]
+fn gc_finalize_decrements_chunk_refcounts() {
+    const CHUNKS: TableDefinition<&str, u64> = TableDefinition::new("chunks");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let first = commit_payloads(&repo, "backup-first", &[b"shared"]);
+    commit_payloads(&repo, "backup-second", &[b"shared"]);
+    repo.apply_delete(&repo.plan_delete("backup-first").unwrap())
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    repo.apply_gc(&plan).unwrap();
+    drop(repo);
+
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let read = db.begin_read().unwrap();
+    let chunks = read.open_table(CHUNKS).unwrap();
+    let count = chunks
+        .get(first[0].as_str())
+        .unwrap()
+        .map(|value| value.value())
+        .unwrap_or(0);
+    assert_eq!(count, 1, "expected the remaining live reference only");
 }
 
 #[test]
@@ -775,7 +857,7 @@ fn gc_rejects_symlinked_manifests_directory_without_touching_external_sentinel()
 #[test]
 fn committed_recovery_refuses_chunk_that_became_live_after_crash() {
     use zerostun::hash::root_hash_from_manifest;
-    use zerostun::manifest::{ChunkDescriptor, Manifest};
+    use zerostun::manifest::Manifest;
     use zerostun::{GcJournal, GcPhase};
 
     const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
@@ -803,7 +885,7 @@ fn committed_recovery_refuses_chunk_that_became_live_after_crash() {
     );
     let repo = Repository::open(&repo_path).unwrap();
     let mut manifest = Manifest::new("backup-new-live", payload.len() as u64, 64, 128, 256);
-    manifest.add_chunk(ChunkDescriptor {
+    manifest.add_chunk(zerostun::manifest::ChunkDescriptor {
         index: 0,
         logical_offset: 0,
         original_length: payload.len() as u64,
@@ -812,19 +894,23 @@ fn committed_recovery_refuses_chunk_that_became_live_after_crash() {
         content_id: cid,
     });
     manifest.root_hash = root_hash_from_manifest(&manifest);
-    repo.commit_manifest(&manifest).unwrap();
+    let error = repo.commit_manifest(&manifest).unwrap_err();
+    assert!(error.to_string().contains("garbage collection"));
     drop(repo);
 
     let reopened = Repository::open(&repo_path).unwrap();
-    assert!(reopened.recover_gc().is_err());
-    assert!(trash.exists());
-    assert!(reopened.load_manifest("backup-new-live").is_ok());
+    assert!(reopened.recover_gc().is_ok());
+    assert!(!trash.exists());
+    assert!(matches!(
+        reopened.load_manifest("backup-new-live"),
+        Err(Error::BackupNotFound(_))
+    ));
 }
 
 #[test]
 fn committed_recovery_refuses_chunk_that_became_tombstoned_after_crash() {
     use zerostun::hash::root_hash_from_manifest;
-    use zerostun::manifest::{ChunkDescriptor, Manifest};
+    use zerostun::manifest::Manifest;
     use zerostun::{GcJournal, GcPhase};
 
     const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
@@ -855,7 +941,7 @@ fn committed_recovery_refuses_chunk_that_became_tombstoned_after_crash() {
     repo.write_chunk(&cid, CompressionCodec::None, payload)
         .unwrap();
     let mut manifest = Manifest::new("backup-new-tombstoned", payload.len() as u64, 64, 128, 256);
-    manifest.add_chunk(ChunkDescriptor {
+    manifest.add_chunk(zerostun::manifest::ChunkDescriptor {
         index: 0,
         logical_offset: 0,
         original_length: payload.len() as u64,
@@ -864,18 +950,16 @@ fn committed_recovery_refuses_chunk_that_became_tombstoned_after_crash() {
         content_id: cid,
     });
     manifest.root_hash = root_hash_from_manifest(&manifest);
-    repo.commit_manifest(&manifest).unwrap();
-    repo.apply_delete(&repo.plan_delete("backup-new-tombstoned").unwrap())
-        .unwrap();
+    let error = repo.commit_manifest(&manifest).unwrap_err();
+    assert!(error.to_string().contains("garbage collection"));
     drop(repo);
 
     let reopened = Repository::open(&repo_path).unwrap();
-    assert!(reopened.recover_gc().is_err());
-    assert!(reopened.chunk_path(&cid).exists());
-    reopened
-        .apply_undelete(&reopened.plan_undelete("backup-new-tombstoned").unwrap())
-        .unwrap();
-    assert!(reopened.load_manifest("backup-new-tombstoned").is_ok());
+    assert!(reopened.recover_gc().is_ok());
+    assert!(matches!(
+        reopened.load_manifest("backup-new-tombstoned"),
+        Err(Error::BackupNotFound(_))
+    ));
 }
 
 #[test]
@@ -901,6 +985,182 @@ fn reader_lease_refuses_atomic_gc_barrier() {
         .to_string()
         .contains("garbage collection"));
     assert!(repo.active_reader_leases().unwrap().is_empty());
+}
+
+#[test]
+fn apply_gc_refuses_when_writer_lock_is_held() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = Repository::init(&temp.path().join("repo")).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"orphan-locked");
+    repo.write_chunk(&cid, CompressionCodec::None, b"orphan-locked")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let _lock = repo.acquire_writer_lock().unwrap();
+    let error = repo.apply_gc(&plan).unwrap_err();
+    assert!(matches!(error, Error::RepositoryLocked(_)));
+}
+
+#[test]
+fn commit_manifest_refuses_pending_gc_journal() {
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"pending-journal");
+    repo.write_chunk(&cid, CompressionCodec::None, b"pending-journal")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    drop(repo);
+    insert_journal(
+        &repo_path,
+        &GcJournal {
+            plan,
+            phase: GcPhase::Moving,
+            moved: Vec::new(),
+        },
+        GC_JOURNALS,
+    );
+
+    let repo = Repository::open(&repo_path).unwrap();
+    let manifest = zerostun::manifest::Manifest::new("backup-after-crash", 0, 64, 128, 256);
+    let error = repo.commit_manifest(&manifest).unwrap_err();
+    assert!(error.to_string().contains("garbage collection"));
+}
+
+#[test]
+fn recover_gc_does_not_leave_barrier_after_pre_mutation_error() {
+    use zerostun::{GcJournal, GcPhase};
+
+    const GC_JOURNALS: TableDefinition<&str, &[u8]> = TableDefinition::new("gc_journals");
+    const GC_STATE: TableDefinition<&str, u8> = TableDefinition::new("gc_state");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    let doomed_payload = b"doomed-barrier";
+    let doomed_cid = zerostun::hash::content_id_from_bytes(doomed_payload);
+    repo.write_chunk(&doomed_cid, CompressionCodec::None, doomed_payload)
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    let item = &plan.reclaim_chunks[0];
+    let trash = repo.root().join(&item.trash);
+    std::fs::create_dir_all(trash.parent().unwrap()).unwrap();
+    std::fs::rename(repo.chunk_path(&doomed_cid), &trash).unwrap();
+    drop(repo);
+
+    let mut live_manifest =
+        zerostun::manifest::Manifest::new("backup-live-after-crash", 0, 64, 128, 256);
+    live_manifest.add_chunk(zerostun::manifest::ChunkDescriptor {
+        index: 0,
+        logical_offset: 0,
+        original_length: doomed_payload.len() as u64,
+        stored_length: doomed_payload.len() as u64,
+        codec: CompressionCodec::None,
+        content_id: doomed_cid,
+    });
+    live_manifest.root_hash = root_hash_from_manifest(&live_manifest);
+    const TABLE_BACKUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("backups");
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let encoded = live_manifest.encode().unwrap();
+        let mut backups = write.open_table(TABLE_BACKUPS).unwrap();
+        backups
+            .insert("backup-live-after-crash", encoded.as_slice())
+            .unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    insert_journal(
+        &repo_path,
+        &GcJournal {
+            plan,
+            phase: GcPhase::Committed,
+            moved: vec![doomed_cid.to_hex()],
+        },
+        GC_JOURNALS,
+    );
+
+    let reopened = Repository::open(&repo_path).unwrap();
+    assert!(reopened.recover_gc().is_err());
+    drop(reopened);
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let read = db.begin_read().unwrap();
+    assert!(read
+        .open_table(GC_STATE)
+        .unwrap()
+        .get("barrier")
+        .unwrap()
+        .is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_removes_proven_stale_leases_before_refusal() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    drop(repo);
+    insert_lease(
+        &repo_path,
+        &zerostun::ReaderLease {
+            lease_id: "lease-dead-gc".to_string(),
+            backup_id: "backup-dead-gc".to_string(),
+            pid: u32::MAX,
+            process_start_token: "0".to_string(),
+            acquired_unix_ms: 1,
+        },
+    );
+    let repo = Repository::open(&repo_path).unwrap();
+    let cid = zerostun::hash::content_id_from_bytes(b"orphan-after-stale");
+    repo.write_chunk(&cid, CompressionCodec::None, b"orphan-after-stale")
+        .unwrap();
+    let plan = repo.plan_gc().unwrap();
+    repo.apply_gc(&plan).unwrap();
+    assert!(repo.active_reader_leases().unwrap().is_empty());
+}
+
+#[test]
+fn gc_barrier_refuses_manifest_delete_and_undelete_mutations() {
+    const GC_STATE: TableDefinition<&str, u8> = TableDefinition::new("gc_state");
+    let temp = tempfile::tempdir().unwrap();
+    let repo_path = temp.path().join("repo");
+    let repo = Repository::init(&repo_path).unwrap();
+    commit_payloads(&repo, "backup-delete", &[b"delete"]);
+    commit_payloads(&repo, "backup-undelete", &[b"undelete"]);
+    let delete_plan = repo.plan_delete("backup-delete").unwrap();
+    repo.apply_delete(&repo.plan_delete("backup-undelete").unwrap())
+        .unwrap();
+    let undelete_plan = repo.plan_undelete("backup-undelete").unwrap();
+    let mut new_manifest = Manifest::new("backup-new", 0, 64, 128, 256);
+    new_manifest.root_hash = root_hash_from_manifest(&new_manifest);
+    drop(repo);
+
+    let db = Database::open(repo_path.join("index.redb")).unwrap();
+    let write = db.begin_write().unwrap();
+    {
+        let mut state = write.open_table(GC_STATE).unwrap();
+        state.insert("barrier", 1).unwrap();
+    }
+    write.commit().unwrap();
+    drop(db);
+    let repo = Repository::open(&repo_path).unwrap();
+
+    assert!(matches!(
+        repo.commit_manifest(&new_manifest),
+        Err(Error::GarbageCollection(_))
+    ));
+    assert!(matches!(
+        repo.apply_delete(&delete_plan),
+        Err(Error::GarbageCollection(_))
+    ));
+    assert!(matches!(
+        repo.apply_undelete(&undelete_plan),
+        Err(Error::GarbageCollection(_))
+    ));
+    assert!(!repo.is_tombstoned("backup-delete").unwrap());
+    assert!(repo.is_tombstoned("backup-undelete").unwrap());
 }
 
 #[test]

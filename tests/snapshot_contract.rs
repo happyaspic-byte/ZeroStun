@@ -5,8 +5,13 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use zerostun::snapshot::{
     CommandRunner, CommandSpec, FakeProvider, FakeRunner, FakeRunnerScript, ProcessRunner,
-    ProviderCapabilities, SnapshotProvider, MAX_COMMAND_OUTPUT_BYTES,
+    ProviderCapabilities, SnapshotHandle, SnapshotProvider, SnapshotRequest,
+    MAX_COMMAND_OUTPUT_BYTES,
 };
+
+fn snapshot_request() -> SnapshotRequest {
+    SnapshotRequest::new("volume-a")
+}
 
 fn secret_spec() -> CommandSpec {
     CommandSpec::new("/usr/bin/probe")
@@ -36,7 +41,10 @@ async fn fake_provider_probe_create_open_cleanup_recover_succeeds() {
             changed_block: false,
         }
     );
-    let handle = provider.create(&CancellationToken::new()).await.unwrap();
+    let handle = provider
+        .create(&snapshot_request(), &CancellationToken::new())
+        .await
+        .unwrap();
     assert_eq!(handle.id, "snap-1");
     let source = provider
         .open_source(&handle, &CancellationToken::new())
@@ -147,7 +155,10 @@ async fn provider_create_failure_still_recovers_leftovers() {
     ]);
     let provider = FakeProvider::new(runner.clone());
     provider.probe(&CancellationToken::new()).await.unwrap();
-    assert!(provider.create(&CancellationToken::new()).await.is_err());
+    assert!(provider
+        .create(&snapshot_request(), &CancellationToken::new())
+        .await
+        .is_err());
     let leftovers = provider.recover(&CancellationToken::new()).await.unwrap();
     assert_eq!(leftovers, vec!["snap-orphan"]);
     provider
@@ -295,4 +306,120 @@ async fn snapshot_provider_is_object_safe_and_accepts_cancellation() {
     cancel.cancel();
     let error = provider.probe(&cancel).await.unwrap_err();
     assert!(matches!(error, zerostun::Error::Cancelled));
+}
+
+#[tokio::test]
+async fn process_runner_does_not_inherit_parent_environment() {
+    std::env::set_var("ZEROSTUN_PARENT_SECRET", "parent-secret-value");
+    let runner = ProcessRunner::new();
+    let spec = CommandSpec::new("/usr/bin/python3")
+        .arg("-c")
+        .arg("import os,sys; sys.stderr.write(os.environ.get('ZEROSTUN_PARENT_SECRET','absent')); sys.exit(7)")
+        .secret_env("ZEROSTUN_PARENT_SECRET");
+    let error = runner
+        .run(&spec, Duration::from_secs(2), &CancellationToken::new())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("absent"));
+    assert!(!error.contains("parent-secret-value"));
+}
+
+#[tokio::test]
+async fn cancelled_fake_runner_call_neither_records_nor_consumes_script() {
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(b"ok")]);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let error = runner
+        .run(
+            &CommandSpec::new("/usr/bin/probe"),
+            Duration::from_secs(1),
+            &cancel,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, zerostun::Error::Cancelled));
+    assert!(runner.recorded().is_empty());
+    let output = runner
+        .run(
+            &CommandSpec::new("/usr/bin/probe"),
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.status, 0);
+}
+
+#[tokio::test]
+async fn provider_rejects_unsafe_snapshot_identifier_and_source_path() {
+    for unsafe_stdout in ["../escape", "a/b", "id\0with-nul"] {
+        let runner = FakeRunner::scripted([FakeRunnerScript::ok(unsafe_stdout.as_bytes())]);
+        let provider = FakeProvider::new(runner);
+        assert!(provider
+            .create(&snapshot_request(), &CancellationToken::new())
+            .await
+            .is_err());
+    }
+
+    for unsafe_source in ["/tmp/../etc/passwd", "relative/source", "/tmp/source\0"] {
+        let runner = FakeRunner::scripted([FakeRunnerScript::ok(unsafe_source.as_bytes())]);
+        let provider = FakeProvider::new(runner);
+        let handle = SnapshotHandle {
+            id: "snap-1".to_string(),
+            source: PathBuf::from("/dev/mapper/snap-1"),
+        };
+        assert!(provider
+            .open_source(&handle, &CancellationToken::new())
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn provider_create_targets_the_requested_volume() {
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(b"snap-targeted")]);
+    let provider = FakeProvider::new(runner.clone());
+    let handle = provider
+        .create(&SnapshotRequest::new("volume-b"), &CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(handle.id, "snap-targeted");
+    assert_eq!(runner.recorded()[0].args, vec!["--create", "volume-b"]);
+}
+
+#[tokio::test]
+async fn failed_command_diagnostics_preserve_status_and_redacted_cause() {
+    let runner = FakeRunner::scripted([FakeRunnerScript::fail(7, b"", b"probe failed")]);
+    let error = runner
+        .run(
+            &CommandSpec::new("/usr/bin/probe"),
+            Duration::from_secs(1),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("status 7"), "status lost: {error}");
+    assert!(error.contains("probe failed"), "cause lost: {error}");
+}
+
+#[tokio::test]
+async fn recorded_command_debug_never_leaks_secret_values() {
+    let runner = FakeRunner::scripted([FakeRunnerScript::ok(b"ok")]);
+    let spec = CommandSpec::new("/usr/bin/probe")
+        .arg("--token")
+        .arg("super-secret-token")
+        .secret_env("ZEROSTUN_TOKEN")
+        .env("ZEROSTUN_TOKEN", "super-secret-token");
+    runner
+        .run(&spec, Duration::from_secs(1), &CancellationToken::new())
+        .await
+        .unwrap();
+    let recorded = runner.recorded();
+    let debug = format!("{recorded:?}");
+    assert!(
+        !debug.contains("super-secret-token"),
+        "debug leaked: {debug}"
+    );
 }

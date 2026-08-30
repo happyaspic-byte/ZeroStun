@@ -23,6 +23,28 @@ pub struct SnapshotHandle {
     pub source: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotRequest {
+    pub target: String,
+}
+
+impl SnapshotRequest {
+    pub fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+        }
+    }
+
+    fn validated_target(&self) -> Result<&str> {
+        if self.target.is_empty() || self.target.contains('\0') {
+            return Err(Error::Snapshot(
+                "snapshot target must be non-empty and contain no NUL byte".to_string(),
+            ));
+        }
+        Ok(&self.target)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
     pub crash_consistent: bool,
@@ -36,8 +58,11 @@ pub trait SnapshotProvider: Send + Sync {
         &'a self,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<ProviderCapabilities>>;
-    fn create<'a>(&'a self, cancel: &'a CancellationToken)
-        -> BoxFuture<'a, Result<SnapshotHandle>>;
+    fn create<'a>(
+        &'a self,
+        request: &'a SnapshotRequest,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<SnapshotHandle>>;
     fn open_source<'a>(
         &'a self,
         handle: &'a SnapshotHandle,
@@ -110,23 +135,21 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for FakeProvider<R> {
 
     fn create<'a>(
         &'a self,
+        request: &'a SnapshotRequest,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<SnapshotHandle>> {
         Box::pin(async move {
+            let target = request.validated_target()?;
             let output = self
                 .run_provider(
                     CommandSpec::new(PROVIDER_PROGRAM)
                         .arg("--create")
-                        .arg(PROVIDER_TARGET),
+                        .arg(target),
                     cancel,
                 )
                 .await?;
             let id = utf8_stdout(&output.stdout)?;
-            if id.is_empty() {
-                return Err(Error::Snapshot(
-                    "snapshot create returned an empty identifier".to_string(),
-                ));
-            }
+            let id = validate_snapshot_id(&id)?;
             Ok(SnapshotHandle {
                 source: PathBuf::from(format!("/dev/mapper/{id}")),
                 id,
@@ -149,12 +172,7 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for FakeProvider<R> {
                 )
                 .await?;
             let source = utf8_stdout(&output.stdout)?;
-            if source.is_empty() {
-                return Err(Error::Snapshot(
-                    "snapshot open returned an empty source".to_string(),
-                ));
-            }
-            Ok(PathBuf::from(source))
+            validate_source_path(&source)
         })
     }
 
@@ -184,7 +202,7 @@ impl<R: CommandRunner + Clone + 'static> SnapshotProvider for FakeProvider<R> {
             if text.is_empty() || text == "[]" {
                 return Ok(Vec::new());
             }
-            Ok(vec![text])
+            Ok(vec![validate_snapshot_id(&text)?])
         })
     }
 
@@ -197,4 +215,46 @@ fn utf8_stdout(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec())
         .map(|value| value.trim().to_string())
         .map_err(|_| Error::Snapshot("snapshot command stdout was not UTF-8".to_string()))
+}
+
+fn validate_snapshot_id(id: &str) -> Result<String> {
+    if id.is_empty() {
+        return Err(Error::Snapshot(
+            "snapshot create returned an empty identifier".to_string(),
+        ));
+    }
+    if id.contains('/') || id.contains('\\') || id.contains('\0') || id == "." || id == ".." {
+        return Err(Error::Snapshot(
+            "snapshot identifier contains unsafe path characters".to_string(),
+        ));
+    }
+    Ok(id.to_string())
+}
+
+fn validate_source_path(source: &str) -> Result<PathBuf> {
+    if source.is_empty() {
+        return Err(Error::Snapshot(
+            "snapshot open returned an empty source".to_string(),
+        ));
+    }
+    if source.contains('\0') {
+        return Err(Error::Snapshot(
+            "snapshot source path contains a NUL byte".to_string(),
+        ));
+    }
+    let path = PathBuf::from(source);
+    if !path.is_absolute() {
+        return Err(Error::Snapshot(
+            "snapshot source path must be absolute".to_string(),
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(Error::Snapshot(
+            "snapshot source path must not contain parent-directory segments".to_string(),
+        ));
+    }
+    Ok(path)
 }
