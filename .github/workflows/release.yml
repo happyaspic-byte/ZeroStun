@@ -61,7 +61,9 @@ jobs:
           cargo clippy --all-targets --all-features --locked -- -D warnings
           cargo test --lib --bins --tests --all-features --locked -- --test-threads=1
           cargo install cargo-deny --locked --version 0.20.2
-          cargo deny check licenses sources bans advisories
+          command -v cargo-deny
+          cargo deny fetch db
+          cargo deny --offline --locked check licenses sources bans advisories
       - name: Build package
         run: scripts/package-release.sh --target "${{ matrix.target }}" --output-dir dist
       - name: Upload archive and checksum

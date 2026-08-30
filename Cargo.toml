@@ -2,7 +2,7 @@
 name = "zerostun"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.90"
 authors = ["ZeroStun Contributors"]
 description = "A lightweight, bounded-I/O backup engine for edge and fault-tolerant systems"
 license = "Apache-2.0 OR MIT"

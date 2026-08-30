@@ -134,29 +134,37 @@ fn supply_chain_policy_is_explicit_and_release_never_creates_tags() {
     assert!(toolchain.contains("rustfmt"));
     assert!(toolchain.contains("clippy"));
     let cargo_toml = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    assert!(cargo_toml.contains("rust-version = \"1.85\""));
+    assert!(cargo_toml.contains("rust-version = \"1.90\""));
+    let declared_msrv = cargo_toml
+        .lines()
+        .find_map(|line| line.strip_prefix("rust-version = \"")?.strip_suffix('"'))
+        .unwrap();
+    let minor: u32 = declared_msrv.split('.').nth(1).unwrap().parse().unwrap();
+    assert!(minor >= 90, "current redb requires Rust 1.90 or newer");
 
     let deny = fs::read_to_string(root.join("deny.toml")).unwrap();
     for license in [
-        "Apache-2.0",
-        "MIT",
-        "Unicode-3.0",
-        "CC0-1.0",
-        "MIT-0",
-        "Unlicense",
+        "\"Apache-2.0\"",
+        "\"MIT\"",
+        "\"Unicode-3.0\"",
+        "\"CC0-1.0\"",
+        "\"MIT-0\"",
+        "\"Unlicense\"",
     ] {
         assert!(
             deny.contains(license),
             "deny.toml does not mention {license}"
         );
     }
+    assert!(!deny.contains("\"BSD-2-Clause\""));
     assert!(!deny.to_ascii_lowercase().contains("unknown = \"allow\""));
     assert!(deny.contains("https://github.com/rust-lang/crates.io-index"));
 
     let ci = fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
     assert!(ci.contains("permissions:\n  contents: read"));
     assert!(ci.contains("persist-credentials: false"));
-    assert!(ci.contains("cargo deny check licenses sources bans advisories"));
+    assert!(ci.contains("command -v cargo-deny"));
+    assert!(ci.contains("cargo deny --offline --locked check licenses sources bans advisories"));
     assert!(ci.contains("--locked"));
 
     let release = fs::read_to_string(root.join(".github/workflows/release.yml")).unwrap();

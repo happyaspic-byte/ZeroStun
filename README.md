@@ -50,9 +50,8 @@ were configured, so no live API mutation was attempted.
 
 ## Build
 
-The declared MSRV policy is Rust 1.85; release builds are pinned to Rust 1.97.1.
-The current lockfile requires a later compiler through `redb`, `fastcdc`, and
-`criterion`, so MSRV 1.85 is documented rather than a passing compile gate.
+The declared MSRV is Rust 1.90, matching `redb 4.2.0`. Release and CI builds
+are pinned to Rust 1.97.1.
 
 ```bash
 cargo build --release --locked

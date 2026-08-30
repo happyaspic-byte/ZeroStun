@@ -7,12 +7,9 @@ Verification level: `local-and-ci`
 ## Policy
 
 `rust-toolchain.toml` pins release and CI builds to Rust 1.97.1 with rustfmt and
-clippy. `Cargo.toml` retains the declared Rust 1.85 MSRV policy. The current
-locked graph cannot compile on 1.85.1: `redb 4.2.0` requires 1.90, `fastcdc
-5.0.0` uses the later `unsigned_is_multiple_of` API, and `criterion 0.8.2`
-requires 1.86. CI therefore tests the pin, not an MSRV compile pass. Raising
-the declared MSRV or replacing those crates without changing repository/state
-semantics is a later compatibility task, not this packaging phase.
+clippy. `Cargo.toml` declares MSRV 1.90, the true minimum for the locked graph
+because `redb 4.2.0` requires rustc 1.90. CI tests the 1.97.1 pin and a
+packaging regression that the declared rust-version is not older than 1.90.
 
 `deny.toml` allows only SPDX licenses present in the current dependency graph:
 Apache-2.0 (including LLVM exception), MIT, Unicode-3.0, CC0-1.0, MIT-0, and
@@ -29,7 +26,10 @@ SHA-256 checksum without publishing or creating a tag. The archive contains:
 - a generated `zerostun(1)` man page
 - `zerostun-daemon.service` and `daemon.toml.example`
 - Apache-2.0 and MIT license texts
-- a CycloneDX 1.5 JSON SBOM generated directly from `Cargo.toml` and `Cargo.lock` without fetching unused-platform crates
+- a CycloneDX 1.5 JSON SBOM generated directly from `Cargo.toml` and `Cargo.lock`
+  without fetching unused-platform crates. This SBOM lists lockfile package
+  names, versions, and PURLs; it does not include crate hashes, registry
+  evidence, or signed provenance.
 
 Required local tools are Cargo/Rust, Bash, Python 3, GNU tar, gzip, `install`,
 and `sha256sum`. A musl build additionally needs the Rust musl target and
@@ -47,7 +47,10 @@ release. Third-party actions are pinned to immutable commit SHAs with the
 reviewed tag recorded only as a comment; action updates require a
 source-policy review. `.github/workflows/ci.yml` uses the same SHA-pinned
 Rust 1.97.1 action, `contents: read`, `persist-credentials: false`, `--locked`
-Cargo invocations, and `cargo deny`.
+Cargo invocations, and `cargo deny`. CI installs `cargo-deny 0.20.2` with
+`--locked`, fetches advisory data, then runs
+`cargo deny --offline --locked check licenses sources bans advisories`. The
+job fails if `cargo-deny` is missing.
 
 No release or tag was created in this phase. Final release publication remains
 blocked on the full release gate and the required 24-hour soak.
@@ -61,7 +64,7 @@ blocked on the full release gate and the required 24-hour soak.
 | `cargo test --lib --bins --tests --all-features --locked --offline -- --test-threads=1` | PASS: 199 passed, 0 failed, 0 ignored across 19 suites, including `release_packaging` |
 | `cargo build --release --locked --offline` | PASS |
 | `cargo audit --file Cargo.lock --no-fetch` | PASS: 185 dependency packages scanned, 0 vulnerabilities reported |
-| `cargo deny --offline check licenses sources bans advisories` | PASS: licenses, sources, and advisories denied-closed; duplicate crate versions reported as warn-only |
+| `cargo deny --offline --locked check licenses sources bans advisories` | PASS: licenses, sources, and advisories denied-closed; duplicate crate versions reported as warn-only |
 
 A local unpublished GNU archive was produced with
 `scripts/package-release.sh` using `TMPDIR` in the workspace. Checksum
