@@ -9,8 +9,8 @@ use crate::error::{Error, Result};
 mod runner;
 
 pub use runner::{
-    redact_text, CommandOutput, CommandRunner, CommandSpec, FakeRunner, FakeRunnerScript,
-    RecordedCommand, MAX_COMMAND_OUTPUT_BYTES,
+    redact_text, BoxFuture, CommandOutput, CommandRunner, CommandSpec, FakeRunner,
+    FakeRunnerScript, ProcessRunner, RecordedCommand, MAX_COMMAND_OUTPUT_BYTES,
 };
 
 const PROVIDER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -31,18 +31,24 @@ pub struct ProviderCapabilities {
     pub changed_block: bool,
 }
 
-pub trait SnapshotProvider {
-    fn probe(&self) -> impl std::future::Future<Output = Result<ProviderCapabilities>> + Send;
-    fn create(&self) -> impl std::future::Future<Output = Result<SnapshotHandle>> + Send;
-    fn open_source(
-        &self,
-        handle: &SnapshotHandle,
-    ) -> impl std::future::Future<Output = Result<PathBuf>> + Send;
-    fn cleanup(
-        &self,
-        handle: &SnapshotHandle,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
-    fn recover(&self) -> impl std::future::Future<Output = Result<Vec<String>>> + Send;
+pub trait SnapshotProvider: Send + Sync {
+    fn probe<'a>(
+        &'a self,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<ProviderCapabilities>>;
+    fn create<'a>(&'a self, cancel: &'a CancellationToken)
+        -> BoxFuture<'a, Result<SnapshotHandle>>;
+    fn open_source<'a>(
+        &'a self,
+        handle: &'a SnapshotHandle,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<PathBuf>>;
+    fn cleanup<'a>(
+        &'a self,
+        handle: &'a SnapshotHandle,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<()>>;
+    fn recover<'a>(&'a self, cancel: &'a CancellationToken) -> BoxFuture<'a, Result<Vec<String>>>;
     fn capabilities(&self) -> ProviderCapabilities;
 }
 
@@ -55,99 +61,135 @@ impl<R> FakeProvider<R> {
     pub fn new(runner: R) -> Self {
         Self { runner }
     }
-}
 
-impl<R: CommandRunner + Clone> FakeProvider<R> {
-    pub async fn probe_with_spec(&self, spec: CommandSpec) -> Result<ProviderCapabilities> {
-        self.runner
-            .run(&spec, PROVIDER_TIMEOUT, &CancellationToken::new())
-            .await?;
-        Ok(self.capabilities())
-    }
-
-    async fn run_provider(&self, spec: CommandSpec) -> Result<CommandOutput> {
-        self.runner
-            .run(&spec, PROVIDER_TIMEOUT, &CancellationToken::new())
-            .await
-    }
-}
-
-impl<R: CommandRunner + Clone> SnapshotProvider for FakeProvider<R> {
-    async fn probe(&self) -> Result<ProviderCapabilities> {
-        self.run_provider(
-            CommandSpec::new(PROVIDER_PROGRAM)
-                .arg("--target")
-                .arg(PROVIDER_TARGET),
-        )
-        .await?;
-        Ok(self.capabilities())
-    }
-
-    async fn create(&self) -> Result<SnapshotHandle> {
-        let output = self
-            .run_provider(
-                CommandSpec::new(PROVIDER_PROGRAM)
-                    .arg("--create")
-                    .arg(PROVIDER_TARGET),
-            )
-            .await?;
-        let id = utf8_stdout(&output.stdout)?;
-        if id.is_empty() {
-            return Err(Error::Snapshot(
-                "snapshot create returned an empty identifier".to_string(),
-            ));
-        }
-        Ok(SnapshotHandle {
-            source: PathBuf::from(format!("/dev/mapper/{id}")),
-            id,
-        })
-    }
-
-    async fn open_source(&self, handle: &SnapshotHandle) -> Result<PathBuf> {
-        let output = self
-            .run_provider(
-                CommandSpec::new(PROVIDER_PROGRAM)
-                    .arg("--open")
-                    .arg(&handle.id),
-            )
-            .await?;
-        let source = utf8_stdout(&output.stdout)?;
-        if source.is_empty() {
-            return Err(Error::Snapshot(
-                "snapshot open returned an empty source".to_string(),
-            ));
-        }
-        Ok(PathBuf::from(source))
-    }
-
-    async fn cleanup(&self, handle: &SnapshotHandle) -> Result<()> {
-        self.run_provider(
-            CommandSpec::new(PROVIDER_PROGRAM)
-                .arg("--cleanup")
-                .arg(&handle.id),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn recover(&self) -> Result<Vec<String>> {
-        let output = self
-            .run_provider(CommandSpec::new(PROVIDER_PROGRAM).arg("--recover"))
-            .await?;
-        let text = utf8_stdout(&output.stdout)?;
-        if text.is_empty() || text == "[]" {
-            return Ok(Vec::new());
-        }
-        Ok(vec![text])
-    }
-
-    fn capabilities(&self) -> ProviderCapabilities {
+    fn fake_capabilities() -> ProviderCapabilities {
         ProviderCapabilities {
             crash_consistent: true,
             read_only: true,
             quiesce: false,
             changed_block: false,
         }
+    }
+}
+
+impl<R: CommandRunner + Clone> FakeProvider<R> {
+    pub async fn probe_with_spec(
+        &self,
+        spec: CommandSpec,
+        cancel: &CancellationToken,
+    ) -> Result<ProviderCapabilities> {
+        self.runner.run(&spec, PROVIDER_TIMEOUT, cancel).await?;
+        Ok(Self::fake_capabilities())
+    }
+
+    async fn run_provider(
+        &self,
+        spec: CommandSpec,
+        cancel: &CancellationToken,
+    ) -> Result<CommandOutput> {
+        self.runner.run(&spec, PROVIDER_TIMEOUT, cancel).await
+    }
+}
+
+impl<R: CommandRunner + Clone + 'static> SnapshotProvider for FakeProvider<R> {
+    fn probe<'a>(
+        &'a self,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<ProviderCapabilities>> {
+        Box::pin(async move {
+            self.run_provider(
+                CommandSpec::new(PROVIDER_PROGRAM)
+                    .arg("--target")
+                    .arg(PROVIDER_TARGET),
+                cancel,
+            )
+            .await?;
+            Ok(self.capabilities())
+        })
+    }
+
+    fn create<'a>(
+        &'a self,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<SnapshotHandle>> {
+        Box::pin(async move {
+            let output = self
+                .run_provider(
+                    CommandSpec::new(PROVIDER_PROGRAM)
+                        .arg("--create")
+                        .arg(PROVIDER_TARGET),
+                    cancel,
+                )
+                .await?;
+            let id = utf8_stdout(&output.stdout)?;
+            if id.is_empty() {
+                return Err(Error::Snapshot(
+                    "snapshot create returned an empty identifier".to_string(),
+                ));
+            }
+            Ok(SnapshotHandle {
+                source: PathBuf::from(format!("/dev/mapper/{id}")),
+                id,
+            })
+        })
+    }
+
+    fn open_source<'a>(
+        &'a self,
+        handle: &'a SnapshotHandle,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<PathBuf>> {
+        Box::pin(async move {
+            let output = self
+                .run_provider(
+                    CommandSpec::new(PROVIDER_PROGRAM)
+                        .arg("--open")
+                        .arg(&handle.id),
+                    cancel,
+                )
+                .await?;
+            let source = utf8_stdout(&output.stdout)?;
+            if source.is_empty() {
+                return Err(Error::Snapshot(
+                    "snapshot open returned an empty source".to_string(),
+                ));
+            }
+            Ok(PathBuf::from(source))
+        })
+    }
+
+    fn cleanup<'a>(
+        &'a self,
+        handle: &'a SnapshotHandle,
+        cancel: &'a CancellationToken,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.run_provider(
+                CommandSpec::new(PROVIDER_PROGRAM)
+                    .arg("--cleanup")
+                    .arg(&handle.id),
+                cancel,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    fn recover<'a>(&'a self, cancel: &'a CancellationToken) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move {
+            let output = self
+                .run_provider(CommandSpec::new(PROVIDER_PROGRAM).arg("--recover"), cancel)
+                .await?;
+            let text = utf8_stdout(&output.stdout)?;
+            if text.is_empty() || text == "[]" {
+                return Ok(Vec::new());
+            }
+            Ok(vec![text])
+        })
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        Self::fake_capabilities()
     }
 }
 
