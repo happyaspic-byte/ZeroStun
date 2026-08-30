@@ -48,7 +48,8 @@ reviewed tag recorded only as a comment; action updates require a
 source-policy review. `.github/workflows/ci.yml` uses the same SHA-pinned
 Rust 1.97.1 action, `contents: read`, `persist-credentials: false`, `--locked`
 Cargo invocations, and `cargo deny`. CI installs `cargo-deny 0.20.2` with
-`--locked`, fetches advisory data, then runs
+`--locked`, runs `cargo fetch --locked` so unused-platform lockfile crates
+are present, fetches advisory data, then runs
 `cargo deny --offline --locked check licenses sources bans advisories`. The
 job fails if `cargo-deny` is missing.
 

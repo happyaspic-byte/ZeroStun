@@ -164,6 +164,7 @@ fn supply_chain_policy_is_explicit_and_release_never_creates_tags() {
     assert!(ci.contains("permissions:\n  contents: read"));
     assert!(ci.contains("persist-credentials: false"));
     assert!(ci.contains("command -v cargo-deny"));
+    assert!(ci.contains("cargo fetch --locked"));
     assert!(ci.contains("cargo deny --offline --locked check licenses sources bans advisories"));
     assert!(ci.contains("--locked"));
 

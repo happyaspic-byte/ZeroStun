@@ -62,6 +62,7 @@ jobs:
           cargo test --lib --bins --tests --all-features --locked -- --test-threads=1
           cargo install cargo-deny --locked --version 0.20.2
           command -v cargo-deny
+          cargo fetch --locked
           cargo deny fetch db
           cargo deny --offline --locked check licenses sources bans advisories
       - name: Build package
